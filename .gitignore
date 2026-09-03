@@ -1,0 +1,26 @@
+# keys and local config
+.env
+.env.*
+!.env.example
+contracts/.env.testnet
+contracts/.env.mainnet
+contracts/.env.mainnet.fee
+
+# local notes
+NOTES.pl.md
+.notes/
+
+# the interface, indexer and keeper are operated privately and stay out of this repository
+web/
+indexer/
+keeper/
+
+# dependencies and build output
+node_modules/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+*.tsbuildinfo
+*.log
+*.bak
