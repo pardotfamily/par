@@ -14,46 +14,36 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {FixedPoint128} from "@uniswap/v4-core/src/libraries/FixedPoint128.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 
-import {IERC721ReceiverLike, IPairPadFeeEscrow, IPairPadLaunchFactory} from "./interfaces/ILaunchpadV2.sol";
+import {IERC721ReceiverLike, IPairPadFeeEscrow} from "../v2/interfaces/ILaunchpadV2.sol";
+import {IPairPadMultiLaunchFactory} from "./interfaces/ILaunchpadV3.sol";
 
 /**
- * @notice The slice of the factory the locker reads: a launch's terms and
- * the key of its pool.
- */
-interface IPairPadLaunchFactoryView is IPairPadLaunchFactory {
-    function poolKeyFor(address token) external view returns (PoolKey memory);
-}
-
-/**
- * @title PairPadLaunchLocker
- * @notice Permanently holds the Uniswap V4 position NFT that is every PairPad
- * launch's market, and collects the LP fees that position earns.
+ * @title PairPadMultiLaunchLocker
+ * @notice Permanently holds the Uniswap V4 position NFTs that are a
+ * multi-market launch's pools, and collects the LP fees they earn.
  *
- * The pools carry a static LP fee and no hook, so the fee a trade pays lands
- * in the position like on any Uniswap pool: in the currency the trader sent
- * in. Buys pay it in the quote asset, sells in the launch token. Anyone may
- * call `collectFees` for a launch; the proceeds are split on the terms the
- * factory froze at launch. The creator's share of both currencies is credited
- * to PairPadFeeEscrow, where the creator claims it. The protocol's share of
- * the quote is paid straight to the protocol fee recipient, so the keeper's
- * routine collection is also the protocol's payout; should that payment fail
- * (ETH to a contract that rejects it), the amount is credited to the escrow
- * instead and nothing is lost. The protocol's share of the launch token is
- * burned: the platform never holds or sells a token it did not create.
+ * Same contract as PairPadLaunchLocker, for launches with several markets:
+ * one position per market, all locked here, all collected in one call and
+ * split on the terms the factory froze at launch. The creator's share of
+ * every currency is credited to the shared PairPadFeeEscrow; the protocol's
+ * share of each quote is paid to the protocol fee recipient (or credited to
+ * the escrow if that payment fails) and its share of the launch token is
+ * burned.
  *
  * The only position action this contract ever encodes is a zero-liquidity
  * decrease, which is how V4 collects fees without touching the liquidity.
  * There is no withdrawal and no arbitrary-call function, so the liquidity
  * behind a launch can never be removed by anyone.
  */
-contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLike {
+contract PairPadMultiLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLike {
     using SafeERC20 for IERC20;
     using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     uint256 private constant BASIS_POINTS = 10_000;
     uint256 private constant COLLECT_DEADLINE_WINDOW = 300;
@@ -67,19 +57,20 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     error OwnershipCannotBeRenounced();
     error TokenNotLaunched();
     error InexactTransfer(address token, uint256 expected, uint256 received);
+    error NoPositions();
 
     event FactorySet(address factory);
-    event PositionLocked(address indexed token, uint256 indexed tokenId);
-    event TokenSupplyLocked(address indexed token, uint256 amount);
+    event PositionLocked(address indexed token, uint256 indexed tokenId, uint256 marketIndex);
     /// @notice The protocol's share of fees paid in the launch token, burned.
     event ProtocolShareBurned(address indexed token, uint256 amount);
     /**
-     * @notice One per `collectFees` that found something to collect. Amounts
-     * are in the pool's currency order; `protocol*` plus `creator*` is what
-     * the position paid out in each currency.
+     * @notice One per market that had something to collect. Amounts are in
+     * the pool's currency order; `protocol*` plus `creator*` is what the
+     * position paid out in each currency.
      */
     event FeesCollected(
         address indexed token,
+        uint256 indexed marketIndex,
         address currency0,
         address currency1,
         uint256 protocolAmount0,
@@ -91,16 +82,14 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     IPositionManager public immutable positionManager;
     IPoolManager public immutable poolManager;
     IPairPadFeeEscrow public immutable feeEscrow;
-    IPairPadLaunchFactoryView public factory;
+    IPairPadMultiLaunchFactory public factory;
 
-    mapping(address token => uint256 tokenId) public lockedPositions;
-    mapping(address token => uint256 amount) public lockedTokenSupply;
-    mapping(address token => bool locked) private _locked;
+    mapping(address token => uint256[] tokenIds) private _lockedPositions;
 
     /**
      * @param initialOwner Administrative owner; only used to wire the factory once.
      * @param positionManager_ The canonical Uniswap V4 PositionManager for this chain.
-     * @param feeEscrow_ Ledger collected fees are credited to.
+     * @param feeEscrow_ Ledger collected fees are credited to (shared with v2).
      */
     constructor(address initialOwner, IPositionManager positionManager_, IPairPadFeeEscrow feeEscrow_)
         Ownable(initialOwner)
@@ -122,7 +111,7 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     function setFactory(address factory_) external onlyOwner {
         if (address(factory) != address(0)) revert AlreadyInitialized();
         if (factory_ == address(0)) revert ZeroAddress();
-        factory = IPairPadLaunchFactoryView(factory_);
+        factory = IPairPadMultiLaunchFactory(factory_);
         emit FactorySet(factory_);
     }
 
@@ -136,10 +125,6 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
 
     /**
      * @notice Rejects safe transfers of anything but a canonical position NFT.
-     * @dev Not part of the launch path: the launch names this locker as the
-     * `MINT_POSITION` owner and the PositionManager mints with a plain
-     * `_mint`, which fires no receiver callback. Custody is established by
-     * the `ownerOf` check in `lockPosition`.
      */
     function onERC721Received(address, address, uint256, bytes calldata) external view returns (bytes4) {
         if (msg.sender != address(positionManager)) revert NotPositionManager();
@@ -147,34 +132,26 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     }
 
     /**
-     * @notice Registers and verifies permanent custody of a launch position.
-     * Called once per launch by the factory, right after the position is
-     * minted to this contract.
+     * @notice Registers and verifies permanent custody of a launch's
+     * positions, in market order. Called once per launch by the factory,
+     * right after the positions are minted to this contract.
      */
-    function lockPosition(address token, uint256 tokenId) external onlyFactory {
-        if (_locked[token]) revert PositionAlreadyLocked();
-        if (IERC721(address(positionManager)).ownerOf(tokenId) != address(this)) revert PositionNotHeld();
-
-        _locked[token] = true;
-        lockedPositions[token] = tokenId;
-        emit PositionLocked(token, tokenId);
-    }
-
-    /**
-     * @notice Permanently locks launch tokens that did not fit into the
-     * position. Rounding dust is normally transferred here directly; this
-     * entry point exists for the factory to lock larger remainders explicitly.
-     */
-    function lockTokenSupply(address token, uint256 amount) external onlyFactory {
-        if (token == address(0)) revert ZeroAddress();
-        if (amount == 0) return;
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        lockedTokenSupply[token] += amount;
-        emit TokenSupplyLocked(token, amount);
+    function lockPositions(address token, uint256[] calldata tokenIds) external onlyFactory {
+        if (_lockedPositions[token].length != 0) revert PositionAlreadyLocked();
+        if (tokenIds.length == 0) revert NoPositions();
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (IERC721(address(positionManager)).ownerOf(tokenIds[i]) != address(this)) revert PositionNotHeld();
+            _lockedPositions[token].push(tokenIds[i]);
+            emit PositionLocked(token, tokenIds[i], i);
+        }
     }
 
     function isLocked(address token) external view returns (bool) {
-        return _locked[token];
+        return _lockedPositions[token].length != 0;
+    }
+
+    function lockedPositions(address token) external view returns (uint256[] memory) {
+        return _lockedPositions[token];
     }
 
     // ---------------------------------------------------------------------
@@ -182,18 +159,16 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     // ---------------------------------------------------------------------
 
     /**
-     * @notice Fees the launch position has earned and not yet collected, in
-     * the pool's currency order. Read from the pool's fee growth, so it is
-     * exact to the wei the collection would pay out.
+     * @notice Fees market `index` of `token` has earned and not yet collected,
+     * in the pool's currency order. Exact to the wei the collection pays out.
      */
-    function pendingFees(address token) external view returns (uint256 amount0, uint256 amount1) {
-        IPairPadLaunchFactory.LaunchedToken memory launch = _launch(token);
-        PoolId poolId = factory.poolKeyFor(token).toId();
-        (uint256 inside0, uint256 inside1) = poolManager.getFeeGrowthInside(poolId, launch.tickLower, launch.tickUpper);
-        // The PositionManager owns every position it manages and salts it
-        // with the NFT id.
+    function pendingFees(address token, uint256 index) public view returns (uint256 amount0, uint256 amount1) {
+        _requireLaunched(token);
+        IPairPadMultiLaunchFactory.Market memory m = factory.getMarket(token, index);
+        PoolId poolId = factory.poolKeyFor(token, index).toId();
+        (uint256 inside0, uint256 inside1) = poolManager.getFeeGrowthInside(poolId, m.tickLower, m.tickUpper);
         (uint128 liquidity, uint256 last0, uint256 last1) = poolManager.getPositionInfo(
-            poolId, address(positionManager), launch.tickLower, launch.tickUpper, bytes32(launch.positionId)
+            poolId, address(positionManager), m.tickLower, m.tickUpper, bytes32(m.positionId)
         );
         unchecked {
             amount0 = FullMath.mulDiv(inside0 - last0, liquidity, FixedPoint128.Q128);
@@ -202,19 +177,56 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
     }
 
     /**
-     * @notice Collects the launch position's accrued fees, pays the protocol
-     * its share of the quote, burns its share of the launch token and credits
-     * the creator's share of both to the fee escrow. Open to anyone: the
-     * recipients are fixed by the launch record, so a stranger calling it
-     * only ever does the beneficiaries a favour.
-     * @dev The split is by the fee terms frozen at launch. The pool's fee is
-     * base + creator tax; the protocol receives its share of the base part
-     * and the creator everything else, applied to each currency alike.
+     * @notice Uncollected fees on every market of `token`, in market order and
+     * each pool's currency order.
      */
-    function collectFees(address token) external nonReentrant returns (uint256 amount0, uint256 amount1) {
-        IPairPadLaunchFactory.LaunchedToken memory launch = _launch(token);
-        PoolKey memory key = factory.poolKeyFor(token);
-        uint256 tokenId = lockedPositions[token];
+    function pendingFeesAll(address token) external view returns (uint256[] memory amount0, uint256[] memory amount1) {
+        uint256 n = _requireLaunched(token).marketCount;
+        amount0 = new uint256[](n);
+        amount1 = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            (amount0[i], amount1[i]) = pendingFees(token, i);
+        }
+    }
+
+    /**
+     * @notice Collects every market's accrued fees, pays the protocol its
+     * share of each quote, burns its share of the launch token and credits
+     * the creator's share of everything to the fee escrow. Open to anyone:
+     * the recipients are fixed by the launch record.
+     * @return collected The total paid out per market, in each pool's
+     * currency order, flattened as [m0.amount0, m0.amount1, m1.amount0, ...].
+     */
+    function collectFees(address token) external nonReentrant returns (uint256[] memory collected) {
+        IPairPadMultiLaunchFactory.LaunchedToken memory launch = _requireLaunched(token);
+        uint256[] storage ids = _lockedPositions[token];
+        uint256 n = ids.length;
+        collected = new uint256[](2 * n);
+        for (uint256 i = 0; i < n; i++) {
+            (collected[2 * i], collected[2 * i + 1]) = _collectMarket(token, i, ids[i], launch);
+        }
+    }
+
+    /**
+     * @notice Collects one market only. Useful when a single pool is busy and
+     * the rest are idle.
+     */
+    function collectMarketFees(address token, uint256 index)
+        external
+        nonReentrant
+        returns (uint256 amount0, uint256 amount1)
+    {
+        IPairPadMultiLaunchFactory.LaunchedToken memory launch = _requireLaunched(token);
+        return _collectMarket(token, index, _lockedPositions[token][index], launch);
+    }
+
+    function _collectMarket(
+        address token,
+        uint256 index,
+        uint256 tokenId,
+        IPairPadMultiLaunchFactory.LaunchedToken memory launch
+    ) private returns (uint256 amount0, uint256 amount1) {
+        PoolKey memory key = factory.poolKeyFor(token, index);
 
         uint256 before0 = _balance(key.currency0);
         uint256 before1 = _balance(key.currency1);
@@ -240,9 +252,6 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
             ? 0
             : FullMath.mulDiv(amount1, uint256(launch.baseFeeBps) * launch.protocolFeeShareBps, totalFeeBps * BASIS_POINTS);
 
-        // The protocol keeps its share of the quote side and burns its share
-        // of the launch token: the platform never holds or sells a token it
-        // did not create.
         bool tokenIs0 = Currency.unwrap(key.currency0) == token;
         if (tokenIs0) _burn(token, protocol0);
         else _payProtocol(key.currency0, launch.protocolFeeRecipient, protocol0);
@@ -253,6 +262,7 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
 
         emit FeesCollected(
             token,
+            index,
             Currency.unwrap(key.currency0),
             Currency.unwrap(key.currency1),
             protocol0,
@@ -262,9 +272,13 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
         );
     }
 
-    function _launch(address token) private view returns (IPairPadLaunchFactory.LaunchedToken memory launch) {
+    function _requireLaunched(address token)
+        private
+        view
+        returns (IPairPadMultiLaunchFactory.LaunchedToken memory launch)
+    {
         launch = factory.getLaunchedToken(token);
-        if (!launch.exists || !_locked[token]) revert TokenNotLaunched();
+        if (!launch.exists || _lockedPositions[token].length == 0) revert TokenNotLaunched();
     }
 
     function _balance(Currency currency) private view returns (uint256) {
@@ -290,8 +304,7 @@ contract PairPadLaunchLocker is Ownable2Step, ReentrancyGuard, IERC721ReceiverLi
 
     /**
      * @dev Burns the protocol's share of fees paid in the launch token. Every
-     * launch token is a PairPadLauncherToken, which is ERC20Burnable, so the
-     * supply really shrinks rather than parking at a dead address.
+     * launch token is a PairPadLauncherToken, which is ERC20Burnable.
      */
     function _burn(address token, uint256 amount) private {
         if (amount == 0) return;

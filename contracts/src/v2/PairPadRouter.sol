@@ -15,21 +15,26 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {PairPadLaunchFactory} from "./PairPadLaunchFactory.sol";
+import {Hop} from "./libraries/Hop.sol";
 
-/// @dev The slice of Uniswap's SwapRouter02 the zap uses. `exactInput` wraps
-/// attached native ETH itself when the path starts at WETH9.
+/// @dev The slice of Uniswap's SwapRouter02 the router uses. With native
+/// value attached and WETH9 as `tokenIn`, SwapRouter02 wraps it itself.
 interface ISwapRouter02 {
-    struct ExactInputParams {
-        bytes path;
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
         address recipient;
         uint256 amountIn;
         uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
     }
 
-    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
 interface IWETH9 is IERC20 {
+    function deposit() external payable;
     function withdraw(uint256 amount) external;
 }
 
@@ -40,12 +45,13 @@ interface IWETH9 is IERC20 {
  * - Exact-input swaps through a launch pool. The pools are plain hookless
  *   V4 pools, so any V4 router can trade them; this one exists so the
  *   frontend has one contract for every flow below.
- * - ETH in and out of pools quoted in an ERC-20. The ETH leg is described
- *   by an `EthLeg`: optional Uniswap V3 hops starting (or ending) at WETH,
- *   followed by optional Uniswap V4 hops ending at the quote asset. All V4
- *   hops and the launch pool run inside one PoolManager unlock, so a quote
- *   asset that only trades on V4 (every PONS graduate, every par token) is
- *   reachable from plain ETH without the buyer ever holding it.
+ * - ETH in and out of pools quoted in an ERC-20, along a route of Uniswap
+ *   V3 and V4 pools in any order. The route is the list of hops the quote
+ *   pricer prices the asset with, so however far from ETH a quote asset
+ *   sits, a buyer pays plain ETH and a seller receives plain ETH. Everything
+ *   runs inside one PoolManager unlock: V4 hops net against each other
+ *   there, and a V3 hop in the middle is fed by taking the previous hop's
+ *   output out and settling the next hop's input back in.
  * - Atomic launch-and-buy, as the factory's trusted launch forwarder: the
  *   token is launched for the real caller and their opening buy lands in the
  *   same transaction, ahead of anyone else.
@@ -68,10 +74,7 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
     error EthTransferFailed();
     error NativeQuoteNeedsNoZap();
     error InsufficientLaunchValue();
-    error PathTooShort();
-    error PathStartMismatch(address expected);
-    error PathEndMismatch(address expected);
-    /// @dev Hop `index` does not contain the currency the previous hop produced.
+    /// @dev Hop `index` does not contain the asset the previous hop produced.
     error RouteBroken(uint256 index);
     /// @dev The route did not end where the caller said it would.
     error RouteEndMismatch(address expected, address actual);
@@ -79,34 +82,33 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
     event ZapBuy(bytes32 indexed poolId, address indexed buyer, uint256 ethIn, uint256 tokensOut);
     event ZapSell(bytes32 indexed poolId, address indexed seller, uint256 tokensIn, uint256 ethOut);
 
-    /**
-     * @notice How ETH reaches an ERC-20 quote asset, or the other way round.
-     * @param v3Path Uniswap V3 hops on the ETH side, packed as
-     *        token(20) . fee(3) . token(20) ... Starts at WETH on a buy and
-     *        ends at WETH on a sell. Empty when the leg is entirely on V4.
-     * @param v4Hops Uniswap V4 pools between the V3 leg's far end (or native
-     *        ETH when `v3Path` is empty) and the quote asset, in trade order.
-     *        Empty when the V3 leg already ends at the quote asset.
-     */
-    struct EthLeg {
-        bytes v3Path;
-        PoolKey[] v4Hops;
+    /// @dev Where the asset being routed currently sits.
+    enum Where {
+        /// @dev Still with the caller: native value already attached, or an
+        /// ERC-20 to be pulled under allowance.
+        Caller,
+        /// @dev A positive delta inside the PoolManager.
+        Manager,
+        /// @dev Held by this contract, native or ERC-20.
+        Router
     }
 
     /// @dev One unlock: `amountIn` of `currencyIn` through `hops` in order.
     struct Route {
-        PoolKey[] hops;
+        Hop[] hops;
         Currency currencyIn;
         uint256 amountIn;
         uint256 minAmountOut;
-        /// @dev Who funds the input: the caller, or this router when the
-        /// input was just bought on V3 and already sits here.
+        /// @dev The wallet trading: funds the input and receives any part a
+        /// hop could not absorb.
         address payer;
-        /// @dev Where the final output is taken to.
+        /// @dev Where the final output goes.
         address recipient;
-        /// @dev The wallet trading; paid any surplus a partially filled hop
-        /// leaves behind.
-        address swapper;
+        /// @dev Deliver native ETH at the end, unwrapping WETH if that is
+        /// what the last hop produced. Otherwise the output must be exactly
+        /// `currencyOut`.
+        bool ethOut;
+        Currency currencyOut;
     }
 
     constructor(IPoolManager manager_, PairPadLaunchFactory factory_, ISwapRouter02 swapRouter_, IWETH9 weth_) {
@@ -148,8 +150,8 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
             revert NativeValueMismatch();
         }
 
-        PoolKey[] memory hops = new PoolKey[](1);
-        hops[0] = key;
+        Hop[] memory hops = new Hop[](1);
+        hops[0] = Hop({key: key, v3: false});
         (amountOut,) = _route(
             Route({
                 hops: hops,
@@ -158,7 +160,8 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
                 minAmountOut: minAmountOut,
                 payer: msg.sender,
                 recipient: recipient,
-                swapper: msg.sender
+                ethOut: false,
+                currencyOut: zeroForOne ? key.currency1 : key.currency0
             })
         );
     }
@@ -169,11 +172,11 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
 
     /**
      * @notice Buys the launch token of `key`, paying in native ETH. The
-     * attached value travels along `leg` to the quote asset and straight on
-     * through the launch pool to `recipient`. An empty leg on a pool quoted
-     * in ETH is just a plain buy.
+     * attached value travels along `leg` (ETH first, the quote asset last)
+     * and straight on through the launch pool to `recipient`. An empty leg
+     * on a pool quoted in ETH is just a plain buy.
      */
-    function buyWithEth(PoolKey calldata key, EthLeg calldata leg, uint256 minTokensOut, address recipient)
+    function buyWithEth(PoolKey calldata key, Hop[] calldata leg, uint256 minTokensOut, address recipient)
         external
         payable
         nonReentrant
@@ -187,52 +190,38 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
 
     /**
      * @notice Sells the launch token of `key` and delivers native ETH to
-     * `recipient`: the launch pool and the leg's V4 hops run in one unlock,
-     * then the V3 hops (if any) finish at WETH, which is unwrapped. Needs an
-     * allowance for the launch token.
+     * `recipient`: the launch pool first, then `leg` (the quote asset first,
+     * ETH last). Needs an allowance for the launch token.
      */
     function sellToEth(
         PoolKey calldata key,
         bool tokenIsCurrency0,
         uint256 tokensIn,
-        EthLeg calldata leg,
+        Hop[] calldata leg,
         uint256 minEthOut,
         address recipient
     ) external nonReentrant returns (uint256 ethOut) {
         if (tokensIn == 0) revert ZeroAmount();
         if (recipient == address(0)) revert ZeroAddress();
 
-        bool v3Tail = leg.v3Path.length != 0;
-        PoolKey[] memory hops = new PoolKey[](1 + leg.v4Hops.length);
-        hops[0] = key;
-        for (uint256 i = 0; i < leg.v4Hops.length; i++) {
-            hops[i + 1] = leg.v4Hops[i];
+        Hop[] memory hops = new Hop[](1 + leg.length);
+        hops[0] = Hop({key: key, v3: false});
+        for (uint256 i = 0; i < leg.length; i++) {
+            hops[i + 1] = leg[i];
         }
 
-        (uint256 out, Currency outCurrency) = _route(
+        (ethOut,) = _route(
             Route({
                 hops: hops,
                 currencyIn: tokenIsCurrency0 ? key.currency0 : key.currency1,
                 amountIn: tokensIn,
-                // With a V3 tail the ETH floor is checked after it.
-                minAmountOut: v3Tail ? 0 : minEthOut,
+                minAmountOut: minEthOut,
                 payer: msg.sender,
-                recipient: v3Tail ? address(this) : recipient,
-                swapper: msg.sender
+                recipient: recipient,
+                ethOut: true,
+                currencyOut: Currency.wrap(address(0))
             })
         );
-
-        if (!v3Tail) {
-            if (!outCurrency.isAddressZero()) revert RouteEndMismatch(address(0), Currency.unwrap(outCurrency));
-            ethOut = out;
-        } else {
-            address first = _requirePathEndpoints(leg.v3Path, address(0), address(weth));
-            if (first != Currency.unwrap(outCurrency)) revert RouteEndMismatch(first, Currency.unwrap(outCurrency));
-            IERC20(first).forceApprove(address(swapRouter), out);
-            ethOut = _v3ExactInput(leg.v3Path, out, minEthOut, 0);
-            weth.withdraw(ethOut);
-            _sendEth(recipient, ethOut);
-        }
         emit ZapSell(_poolId(key), msg.sender, tokensIn, ethOut);
     }
 
@@ -251,7 +240,7 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
         PairPadLaunchFactory.TokenParams calldata params,
         uint256 launchConfigId,
         address pairToken,
-        EthLeg calldata leg,
+        Hop[] calldata leg,
         uint256 minTokensOut
     ) external payable nonReentrant returns (address token, PoolId poolId, uint256 tokensOut) {
         uint256 launchFee = factory.launchFee();
@@ -263,19 +252,8 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
 
         PoolKey memory key = factory.poolKeyFor(token);
         if (pairToken == address(0)) {
-            PoolKey[] memory hops = new PoolKey[](1);
-            hops[0] = key;
-            (tokensOut,) = _route(
-                Route({
-                    hops: hops,
-                    currencyIn: key.currency0,
-                    amountIn: buyValue,
-                    minAmountOut: minTokensOut,
-                    payer: msg.sender,
-                    recipient: msg.sender,
-                    swapper: msg.sender
-                })
-            );
+            Hop[] memory none;
+            tokensOut = _buyAlongLeg(key, none, buyValue, minTokensOut, msg.sender);
         } else {
             tokensOut = _buyAlongLeg(key, leg, buyValue, minTokensOut, msg.sender);
             emit ZapBuy(PoolId.unwrap(poolId), msg.sender, buyValue, tokensOut);
@@ -301,8 +279,8 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
         if (quoteIn == 0) return (token, poolId, 0);
 
         PoolKey memory key = factory.poolKeyFor(token);
-        PoolKey[] memory hops = new PoolKey[](1);
-        hops[0] = key;
+        Hop[] memory hops = new Hop[](1);
+        hops[0] = Hop({key: key, v3: false});
         (tokensOut,) = _route(
             Route({
                 hops: hops,
@@ -311,7 +289,8 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
                 minAmountOut: minTokensOut,
                 payer: msg.sender,
                 recipient: msg.sender,
-                swapper: msg.sender
+                ethOut: false,
+                currencyOut: Currency.unwrap(key.currency0) == token ? key.currency0 : key.currency1
             })
         );
     }
@@ -320,54 +299,49 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
     // Leg assembly
     // ---------------------------------------------------------------------
 
-    /**
-     * @dev Spends `ethIn` along `leg` and through the launch pool `key`.
-     * With V3 hops the ETH is first swapped there and the proceeds fund the
-     * V4 unlock from this contract; without them the unlock is funded with
-     * native ETH from the caller and the first V4 hop must be an ETH pool.
-     */
+    /// @dev Spends `ethIn` along `leg` and through the launch pool `key`.
     function _buyAlongLeg(
         PoolKey memory key,
-        EthLeg calldata leg,
+        Hop[] memory leg,
         uint256 ethIn,
         uint256 minTokensOut,
         address recipient
     ) private returns (uint256 tokensOut) {
-        PoolKey[] memory hops = new PoolKey[](leg.v4Hops.length + 1);
-        for (uint256 i = 0; i < leg.v4Hops.length; i++) {
-            hops[i] = leg.v4Hops[i];
+        Hop[] memory hops = new Hop[](leg.length + 1);
+        for (uint256 i = 0; i < leg.length; i++) {
+            hops[i] = leg[i];
         }
-        hops[leg.v4Hops.length] = key;
-
-        Currency currencyIn;
-        uint256 amountIn;
-        address payer;
-        if (leg.v3Path.length != 0) {
-            address last = _requirePathEndpoints(leg.v3Path, address(weth), address(0));
-            currencyIn = Currency.wrap(last);
-            amountIn = _v3ExactInput(leg.v3Path, ethIn, 0, ethIn);
-            payer = address(this);
-        } else {
-            currencyIn = Currency.wrap(address(0));
-            amountIn = ethIn;
-            payer = msg.sender;
-        }
+        hops[leg.length] = Hop({key: key, v3: false});
+        Currency tokenCurrency = _launchTokenOf(key, leg);
 
         (tokensOut,) = _route(
             Route({
                 hops: hops,
-                currencyIn: currencyIn,
-                amountIn: amountIn,
+                currencyIn: Currency.wrap(address(0)),
+                amountIn: ethIn,
                 minAmountOut: minTokensOut,
-                payer: payer,
+                payer: msg.sender,
                 recipient: recipient,
-                swapper: msg.sender
+                ethOut: false,
+                currencyOut: tokenCurrency
             })
         );
     }
 
+    /**
+     * @dev The side of the launch pool the buy comes out of: the side the
+     * leg does not arrive on. With no leg the buy arrives as ETH, so it is
+     * the side that is not ETH.
+     */
+    function _launchTokenOf(PoolKey memory key, Hop[] memory leg) private view returns (Currency) {
+        if (leg.length == 0) return _isEth(key.currency0) ? key.currency1 : key.currency0;
+        PoolKey memory last = leg[leg.length - 1].key;
+        bool quoteIs0 = key.currency0 == last.currency0 || key.currency0 == last.currency1;
+        return quoteIs0 ? key.currency1 : key.currency0;
+    }
+
     // ---------------------------------------------------------------------
-    // V4 plumbing
+    // Route engine
     // ---------------------------------------------------------------------
 
     function _route(Route memory r) private returns (uint256 amountOut, Currency currencyOut) {
@@ -376,121 +350,218 @@ contract PairPadRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /**
-     * @dev Runs every hop of the route as an exact-input swap, each fed by
-     * the previous hop's output, then settles with the PoolManager. Between
-     * hops nothing moves: the intermediate currencies net to zero inside the
-     * unlock, unless a hop ran dry and left a surplus, which goes to the
-     * swapper.
+     * @dev Walks the route hop by hop, tracking where the asset sits. A V4
+     * hop swaps inside the PoolManager and its input is settled from
+     * wherever the asset is: netted against a credit already there, paid
+     * from this contract, or pulled from the caller. A V3 hop needs the
+     * asset in this contract, so a credit is taken out first, and leaves its
+     * output here for the next hop to settle in. Native ETH and WETH are
+     * treated as one asset and converted whenever a hop wants the other
+     * form. A hop that runs out of liquidity takes less than offered; the
+     * rest goes back to the payer at once.
      */
     function unlockCallback(bytes calldata raw) external returns (bytes memory) {
         if (msg.sender != address(manager)) revert NotPoolManager();
         Route memory r = abi.decode(raw, (Route));
 
-        Currency current = r.currencyIn;
-        uint256 amount = r.amountIn;
+        Currency cur = r.currencyIn;
+        uint256 amt = r.amountIn;
+        Where at = Where.Caller;
         uint256 n = r.hops.length;
         for (uint256 i = 0; i < n; i++) {
-            PoolKey memory key = r.hops[i];
-            bool zeroForOne;
-            if (current == key.currency0) zeroForOne = true;
-            else if (current == key.currency1) zeroForOne = false;
-            else revert RouteBroken(i);
+            Hop memory hop = r.hops[i];
+            (Currency hopIn, Currency hopOut, bool ok) = _sides(hop, cur);
+            if (!ok) revert RouteBroken(i);
 
-            BalanceDelta delta = manager.swap(
-                key,
-                SwapParams({
-                    zeroForOne: zeroForOne,
-                    amountSpecified: -int256(amount),
-                    sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-                }),
-                ""
-            );
-            int128 outSigned = zeroForOne ? delta.amount1() : delta.amount0();
-            amount = uint256(uint128(outSigned));
-            current = zeroForOne ? key.currency1 : key.currency0;
-        }
-        if (current == r.currencyIn) revert RouteBroken(n);
-        if (amount < r.minAmountOut) revert SlippageExceeded(amount, r.minAmountOut);
-
-        // Pay for the input. A hop that runs out of liquidity owes less than
-        // amountIn; the rest goes back to whoever paid.
-        uint256 owed = uint256(-_delta(r.currencyIn));
-        if (r.currencyIn.isAddressZero()) {
-            manager.sync(r.currencyIn);
-            manager.settle{value: owed}();
-            uint256 excess = r.amountIn - owed;
-            if (excess != 0) _sendEth(r.payer == address(this) ? r.swapper : r.payer, excess);
-        } else {
-            manager.sync(r.currencyIn);
-            IERC20 tokenIn = IERC20(Currency.unwrap(r.currencyIn));
-            if (r.payer == address(this)) {
-                tokenIn.safeTransfer(address(manager), owed);
-                uint256 excess = r.amountIn - owed;
-                if (excess != 0) tokenIn.safeTransfer(r.swapper, excess);
+            if (hop.v3) {
+                (cur, amt, at) = _v3Hop(hop, cur, hopOut, amt, at, r.payer);
             } else {
-                tokenIn.safeTransferFrom(r.payer, address(manager), owed);
+                (cur, amt, at) = _v4Hop(hop, cur, hopIn, hopOut, amt, at, r.payer);
             }
-            manager.settle();
         }
+        if (amt < r.minAmountOut) revert SlippageExceeded(amt, r.minAmountOut);
 
-        if (amount != 0) manager.take(current, r.recipient, amount);
-
-        // Intermediate currencies only carry a balance when a later hop
-        // could not absorb everything the earlier one produced.
-        Currency mid = r.currencyIn;
-        for (uint256 i = 0; i + 1 < n; i++) {
-            PoolKey memory key = r.hops[i];
-            mid = mid == key.currency0 ? key.currency1 : key.currency0;
-            int256 left = _delta(mid);
-            if (left > 0) manager.take(mid, r.swapper, uint256(left));
+        if (r.ethOut) {
+            if (!_isEth(cur)) revert RouteEndMismatch(address(0), Currency.unwrap(cur));
+            (cur, amt, at) = _asNative(cur, amt, at);
+            if (at == Where.Manager) manager.take(cur, r.recipient, amt);
+            else _sendEth(r.recipient, amt);
+        } else {
+            if (!(cur == r.currencyOut)) revert RouteEndMismatch(Currency.unwrap(r.currencyOut), Currency.unwrap(cur));
+            if (at == Where.Manager) manager.take(cur, r.recipient, amt);
+            else if (cur.isAddressZero()) _sendEth(r.recipient, amt);
+            else IERC20(Currency.unwrap(cur)).safeTransfer(r.recipient, amt);
         }
-
-        return abi.encode(amount, current);
+        return abi.encode(amt, cur);
     }
 
-    /// @dev This contract's transient balance of `currency` in the PoolManager.
-    function _delta(Currency currency) private view returns (int256) {
-        bytes32 slot = keccak256(abi.encode(address(this), Currency.unwrap(currency)));
-        return int256(uint256(manager.exttload(slot)));
+    /**
+     * @dev One V4 swap. The input is settled according to where it sits;
+     * the output stays as a credit in the PoolManager for the next hop.
+     */
+    function _v4Hop(
+        Hop memory hop,
+        Currency cur,
+        Currency hopIn,
+        Currency hopOut,
+        uint256 amt,
+        Where at,
+        address payer
+    ) private returns (Currency, uint256, Where) {
+        if (!(cur == hopIn)) {
+            // ETH in the wrong form for this pool: convert it here first.
+            (cur, amt, at) = _bring(cur, amt, at, payer);
+            (cur, amt) = hopIn.isAddressZero() ? _toNative(cur, amt) : _toWeth(cur, amt);
+        }
+
+        bool zeroForOne = cur == hop.key.currency0;
+        BalanceDelta delta = manager.swap(
+            hop.key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amt),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            ""
+        );
+        int128 inSigned = zeroForOne ? delta.amount0() : delta.amount1();
+        int128 outSigned = zeroForOne ? delta.amount1() : delta.amount0();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 consumed = uint256(uint128(-inSigned));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 out = uint256(uint128(outSigned));
+        uint256 leftover = amt - consumed;
+
+        if (at == Where.Manager) {
+            // The credit from the previous hop pays; whatever it did not
+            // consume is still a credit and goes back to the payer.
+            if (leftover != 0) manager.take(cur, payer, leftover);
+        } else if (at == Where.Router) {
+            _settleFromRouter(cur, consumed);
+            if (leftover != 0) _payOut(cur, payer, leftover);
+        } else {
+            // From the caller: native value is already here, an ERC-20 is
+            // pulled straight into the PoolManager.
+            if (cur.isAddressZero()) {
+                _settleFromRouter(cur, consumed);
+                if (leftover != 0) _sendEth(payer, leftover);
+            } else {
+                manager.sync(cur);
+                IERC20(Currency.unwrap(cur)).safeTransferFrom(payer, address(manager), consumed);
+                manager.settle();
+            }
+        }
+        return (hopOut, out, Where.Manager);
+    }
+
+    /**
+     * @dev One V3 swap through SwapRouter02. The input has to be in this
+     * contract; the output lands here too.
+     */
+    function _v3Hop(Hop memory hop, Currency cur, Currency hopOut, uint256 amt, Where at, address payer)
+        private
+        returns (Currency, uint256, Where)
+    {
+        (cur, amt, at) = _bring(cur, amt, at, payer);
+        address tokenOut = Currency.unwrap(hopOut);
+        uint256 value;
+        if (cur.isAddressZero()) {
+            // SwapRouter02 wraps attached value when tokenIn is WETH9.
+            value = amt;
+        } else {
+            IERC20(Currency.unwrap(cur)).forceApprove(address(swapRouter), amt);
+        }
+        uint256 out = swapRouter.exactInputSingle{value: value}(
+            ISwapRouter02.ExactInputSingleParams({
+                tokenIn: cur.isAddressZero() ? address(weth) : Currency.unwrap(cur),
+                tokenOut: tokenOut,
+                fee: hop.key.fee,
+                recipient: address(this),
+                amountIn: amt,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
+        );
+        return (hopOut, out, Where.Router);
+    }
+
+    /// @dev Moves the asset into this contract from wherever it sits.
+    function _bring(Currency cur, uint256 amt, Where at, address payer) private returns (Currency, uint256, Where) {
+        if (at == Where.Manager) {
+            manager.take(cur, address(this), amt);
+        } else if (at == Where.Caller && !cur.isAddressZero()) {
+            IERC20(Currency.unwrap(cur)).safeTransferFrom(payer, address(this), amt);
+        }
+        // Native value from the caller is already here.
+        return (cur, amt, Where.Router);
+    }
+
+    /// @dev Pays `amt` of `cur` held by this contract into the PoolManager.
+    function _settleFromRouter(Currency cur, uint256 amt) private {
+        manager.sync(cur);
+        if (cur.isAddressZero()) {
+            manager.settle{value: amt}();
+        } else {
+            IERC20(Currency.unwrap(cur)).safeTransfer(address(manager), amt);
+            manager.settle();
+        }
+    }
+
+    function _payOut(Currency cur, address to, uint256 amt) private {
+        if (cur.isAddressZero()) _sendEth(to, amt);
+        else IERC20(Currency.unwrap(cur)).safeTransfer(to, amt);
+    }
+
+    /// @dev ETH held here in either form, delivered as native.
+    function _asNative(Currency cur, uint256 amt, Where at) private returns (Currency, uint256, Where) {
+        if (cur.isAddressZero()) return (cur, amt, at);
+        if (at == Where.Manager) {
+            manager.take(cur, address(this), amt);
+            at = Where.Router;
+        }
+        (cur, amt) = _toNative(cur, amt);
+        return (cur, amt, at);
+    }
+
+    function _toNative(Currency cur, uint256 amt) private returns (Currency, uint256) {
+        if (cur.isAddressZero()) return (cur, amt);
+        weth.withdraw(amt);
+        return (Currency.wrap(address(0)), amt);
+    }
+
+    function _toWeth(Currency cur, uint256 amt) private returns (Currency, uint256) {
+        if (!cur.isAddressZero()) return (cur, amt);
+        weth.deposit{value: amt}();
+        return (Currency.wrap(address(weth)), amt);
+    }
+
+    /**
+     * @dev Which side of `hop` the asset enters and which it leaves. Native
+     * ETH and WETH match each other, so a route can move between V3 (WETH)
+     * and native V4 pools; the caller converts.
+     */
+    function _sides(Hop memory hop, Currency cur) private view returns (Currency hopIn, Currency hopOut, bool ok) {
+        Currency c0 = hop.key.currency0;
+        Currency c1 = hop.key.currency1;
+        if (cur == c0) return (c0, c1, true);
+        if (cur == c1) return (c1, c0, true);
+        if (_isEth(cur)) {
+            if (_isEth(c0)) return (c0, c1, true);
+            if (_isEth(c1)) return (c1, c0, true);
+        }
+        return (hopIn, hopOut, false);
+    }
+
+    function _isEth(Currency c) private view returns (bool) {
+        return c.isAddressZero() || Currency.unwrap(c) == address(weth);
     }
 
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
 
-    function _v3ExactInput(bytes calldata path, uint256 amountIn, uint256 minOut, uint256 value)
-        private
-        returns (uint256)
-    {
-        return swapRouter.exactInput{value: value}(
-            ISwapRouter02.ExactInputParams({
-                path: path, recipient: address(this), amountIn: amountIn, amountOutMinimum: minOut
-            })
-        );
-    }
-
     function _poolId(PoolKey calldata key) private pure returns (bytes32) {
         return keccak256(abi.encode(key));
-    }
-
-    /**
-     * @dev Checks a V3 path's endpoints. A zero `first` or `last` means
-     * "any"; the other end is returned so the caller can chain it into the
-     * V4 route. Intermediate hops are the caller's choice; the slippage
-     * floors are what actually protect the trade.
-     */
-    function _requirePathEndpoints(bytes calldata path, address first, address last)
-        private
-        pure
-        returns (address other)
-    {
-        // A V3 path is token(20) . fee(3) . token(20) [. fee(3) . token(20)]...
-        if (path.length < 43) revert PathTooShort();
-        address start = address(bytes20(path[:20]));
-        address end = address(bytes20(path[path.length - 20:]));
-        if (first != address(0) && start != first) revert PathStartMismatch(first);
-        if (last != address(0) && end != last) revert PathEndMismatch(last);
-        other = first == address(0) ? start : end;
     }
 
     function _sendEth(address recipient, uint256 amount) private {

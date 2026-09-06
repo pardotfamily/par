@@ -5,7 +5,9 @@ deploys a token and, in the same transaction, its Uniswap v4 pool opens with the
 in one permanently locked position. There is no bonding curve contract and no migration: the
 pool that exists in the first second is the pool the token lives in forever. It has no hook, so
 anything that can trade Uniswap v4 can trade it from the first block. Any ERC-20 with a deep
-enough Uniswap market on the chain can be the quote asset, not just ETH.
+enough Uniswap market on the chain can be the quote asset, not just ETH. A token can also open
+against several quote assets at once, one pool per asset, which is how a basket of other tokens
+becomes tradable under one address (see "Multi-market launches").
 
 This repository holds the protocol: Solidity sources, tests, deploy scripts and the mainnet
 addresses. The interface, indexer and keeper are operated by the team and are not part of this
@@ -35,10 +37,12 @@ The docs on the site cover the same surface plus the public indexer API.
 5. `PairPadLaunchLocker.collectFees(token)` pulls the position's owed fees out with a
    zero-liquidity decrease and splits them by the terms frozen in the launch record: the
    protocol gets its share (50%) of the base fee part, the creator gets the rest of the base
-   fee and the whole creator tax. The protocol's part is paid to its wallet on the spot (if
-   that transfer fails it is credited to the escrow instead); the creator's part is credited to
-   `PairPadFeeEscrow` and claimed from there. Anyone can call it; the keeper does every fifteen
-   minutes and the creator's claim on the token page does it too.
+   fee and the whole creator tax. The protocol's part in the quote asset is paid to its wallet
+   on the spot (if that transfer fails it is credited to the escrow instead); the protocol's
+   part in the launch token is burned (`ProtocolShareBurned`), so every sell shrinks the
+   supply. The creator's part is credited to `PairPadFeeEscrow` and claimed from there. Anyone
+   can call it; the keeper does every fifteen minutes and the creator's claim on the token page
+   does it too.
 
 There is no snipe tax, no trading delay and no lock on third party liquidity. The dev buy in
 `launchAndBuyWithEth` / `launchAndBuyWithQuote` is the only buy guaranteed to be first, because
@@ -47,20 +51,31 @@ it lands in the launch transaction.
 ### Quote assets without a whitelist
 
 Most launchpads keep an owner-maintained list of approved pair tokens with hand-set economics.
-par has no list; `PairPadQuotePricer` decides on chain:
+par has no list; `PairPadQuotePricer` decides on chain by pricing the asset in ETH through a
+route of Uniswap pools:
 
-- The pricer looks for a Uniswap pool pairing the asset with WETH, ETH or USDG. Uniswap v3
-  pools are found through the v3 factory at the standard fee tiers. Uniswap v4 pools are
-  found through reference registries: `PonsReferenceRegistry` reads pool terms from the pons
-  factory, so every pons graduate is known without registration, and
-  `PairPadReferenceRegistry` does the same for par's own launches. Anyone can also
-  `registerV4Pool(key)` for a pool with an allowed hook (none, or the pons hook).
-- A pool qualifies when its in-range liquidity on the anchor side is worth at least
-  `minReferenceEth` (5 ETH). Two hops are allowed, asset to USDG to ETH, and the USDG leg has
-  to clear the same floor priced in USDG. The deepest qualifying pool wins.
-- The price is the pool's spot price at the moment of the launch. `describe(token)` returns
-  the pool the pricer would use, its depth and the floor it has to clear, which is how the
-  interface explains a refusal.
+- A route is a list of `Hop`s (`libraries/Hop.sol`: a v4 `PoolKey`, or a v3 pool described in
+  the same shape with `v3 = true`) from the asset to ETH or WETH, up to four hops, v3 and v4 in
+  any order, ETH only at the end. The price is the product of the hops' spot prices at the
+  moment of the launch.
+- Every hop has to hold at least `minReferenceEth` (5 ETH) worth of its side nearer ETH in
+  range, measured in ETH for an ETH or WETH pool and converted through the rest of the route
+  otherwise. A route's strength is its weakest hop over that floor.
+- The pricer finds short routes on its own: the deepest pool pairing the asset with ETH or
+  WETH, or two hops through USDG. Uniswap v3 pools come from the v3 factory at the standard
+  fee tiers. Uniswap v4 pools come from reference registries: `PonsReferenceRegistry` reads
+  pool terms from the pons factory, so every pons graduate is known without registration,
+  `PairPadReferenceRegistry` does the same for par's own launches and
+  `PairPadMultiReferenceRegistry` for multi-market launches. Anyone can also
+  `registerV4Pool(key)` for an initialized pool whose hook is on the pricer's allow list
+  (no hook, or a hook the owner has allowed).
+- Longer routes are registered: `registerPath(token, hops)` stores a route anyone can submit,
+  after `evaluatePath` has checked it. A stored route is only replaced by a stronger one while
+  it still qualifies; once it has fallen under the floor anyone can replace it. When both a
+  stored and an automatic route qualify, the stronger one is used.
+- `route(token)` returns the hops in use and whether they qualify; `describe(token)` returns
+  the same with every hop's depth and floor and, when the asset cannot be priced, which hop
+  failed and why. That is how the interface explains a refusal.
 - The factory owner can still set curated economics for an asset with `setPairTokenEconomics`,
   which takes priority over the pricer.
 
@@ -74,28 +89,79 @@ do not work either.
 
 ### Paying in ETH for a launch quoted in something else
 
-`PairPadRouter.buyWithEth` takes ETH to the quote asset and on through the launch pool in one
-transaction; `sellToEth` is the reverse. The ETH side is described by an `EthLeg`:
-
-```solidity
-struct EthLeg {
-    bytes v3Path;      // Uniswap v3 hops, WETH -> ... on a buy, ... -> WETH on a sell; may be empty
-    PoolKey[] v4Hops;  // Uniswap v4 pools from there to the quote asset, in trade order; may be empty
-}
-```
-
-The v3 hops run on SwapRouter02 first. The v4 hops and the launch pool then run inside a
+`PairPadRouter.buyWithEth(key, leg, minTokensOut, recipient)` takes ETH along `leg`, a
+`Hop[]` from ETH to the quote asset, and on through the launch pool in one transaction;
+`sellToEth` is the reverse, launch pool first and ETH last. The leg is the pricer's own route
+for the asset (`route(quote)`, reversed for a buy), so the trade goes exactly where the depth
+the pricer measured is. v3 hops run on SwapRouter02, v4 hops and the launch pool inside a
 single PoolManager unlock, so a quote that only trades on v4 (every PONS graduate, every par
-token) is reachable from plain ETH and the buyer never holds it. A quote with a v3 WETH pool
-uses `v3Path` alone; a PONS token uses `v4Hops = [its ETH pool]` alone; a token whose only
-market is against USDG combines the two. The frontend builds the leg from the same reference
-pools `PairPadQuotePricer.describe` reports, so the trade goes where the depth is.
+token) is reachable from plain ETH and the buyer never holds it. For a launch quoted in ETH the
+leg is empty and the call is a plain buy.
 
 `swapExactIn` is a plain swap through one pool. `launchAndBuyWithEth` and
 `launchAndBuyWithQuote` create a launch for the real caller and land the creator's first buy in
 the same transaction, so nobody can get in front of it. The router is the factory's trusted
 launch forwarder for that purpose and holds no funds between transactions. Nothing else needs
 the router: the pools are ordinary v4 pools and Uniswap's own router trades them.
+
+## Multi-market launches
+
+A token does not have to pick one quote asset. `PairPadMultiLaunchFactory.launchToken(params,
+configId, pairTokens)` opens up to five plain v4 pools for the same token in one transaction,
+one per asset in `pairTokens` (native ETH as `address(0)`, WETH not allowed next to it, no
+duplicates). The supply is split equally between the pools and each opens at the same price
+with its slice of the phantom reserve, converted into its asset by the same pricer, so the
+token has one opening market cap spread over several books. Each pool's position is minted by
+`PairPadMultiPositionMinter` and locked in `PairPadMultiLaunchLocker`; the token contract, the
+fee escrow and the pricer are shared with the single-market stack, and a token belongs to
+exactly one of the two factories.
+
+The pools share a token, so arbitrage keeps their prices together: a buy in one pool that
+lifts the price there is met by sellers in the others, and a trade lands on the depth of all of
+them. That is what makes a basket possible. A token opened against five other tokens moves with
+all five, weighted by how much of the supply each pool still holds, and it can be bought or
+sold directly with any of them. The first one on mainnet, INDEX
+(`0x7841a0a37834EEB13Ad5DBaD692049C84CD6A73C`), is quoted in the Apple, Microsoft, NVIDIA,
+Alphabet and Tesla stock tokens on the chain.
+
+`PairPadMultiRouter` trades several markets in one transaction. A `Leg` is one market's share
+of the trade plus the route between ETH and that market's quote asset:
+
+```solidity
+struct Leg { uint8 market; Hop[] hops; uint256 amountIn; }
+
+function buyWithEth(address token, Leg[] legs, uint256 minTokensOut, address recipient) payable returns (uint256 tokensOut);
+function sellToEth(address token, Leg[] legs, uint256 minEthOut, address recipient) returns (uint256 ethOut);
+function sellToQuotes(address token, Leg[] legs, uint256[] minOuts, address recipient);
+function buyWithQuote(address token, uint8 market, uint256 quoteIn, uint256 minTokensOut, address recipient) payable returns (uint256 tokensOut);
+function launchAndBuyWithEth(TokenParams params, uint256 launchConfigId, address[] pairTokens, Leg[] legs, uint256 minTokensOut) payable returns (address token, uint256 tokensOut);
+```
+
+The legs' amounts add up to the input and the floor is on the total; the launch pool itself is
+appended by the router. Nothing requires it: each market is an ordinary v4 pool with the key
+from `factory.poolKeyFor(token, index)`, and a terminal that quotes the pools picks whichever
+is cheapest at that moment.
+
+Fees are collected per market. `locker.pendingFees(token, index)` and
+`pendingFeesAll(token)` read them, `collectFees(token)` collects every market and
+`collectMarketFees(token, index)` one; the split is the one frozen in the launch record, the
+creator's part goes to the shared `PairPadFeeEscrow` in each market's quote asset and in the
+token. The factory can be closed to a whitelist by its owner; `canLaunch(address)` says where a
+wallet stands. It is open to every wallet at the moment.
+
+Events, same names as the single-market factory and locker but different shapes, so an indexer
+keys them by contract address and topic:
+
+```
+TokenLaunched(address indexed token, address indexed deployer, uint256 launchConfigId, uint24 poolFee, address[] pairTokens)
+MarketOpened(address indexed token, bytes32 indexed poolId, uint256 marketIndex, address pairToken, uint256 positionId, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 tokenAmount, uint256 phantomQuote)
+FeesCollected(address indexed token, uint256 indexed marketIndex, address currency0, address currency1, uint256 protocolAmount0, uint256 protocolAmount1, uint256 creatorAmount0, uint256 creatorAmount1)
+```
+
+One `MarketOpened` per pool precedes the launch's `TokenLaunched` in the same transaction, in
+market order. `getLaunchedToken(token)` returns the record (deployer, fee recipient, fee terms,
+pool fee, tick spacing, market count) and `getMarkets(token)` the per-market pair token,
+phantom reserve, ticks, liquidity and position id.
 
 ## Reading launches from the chain
 
@@ -148,20 +214,29 @@ one artifact covers every launch.
 
 ## Mainnet deployment
 
-Robinhood Chain, chain id 4663, deployed at block 53778163. Sources verified on Blockscout and
-Sourcify as exact matches.
+Robinhood Chain, chain id 4663. The single-market stack was deployed at block 53890474, the
+multi-market stack at block 55587224. Sources verified on Blockscout and Sourcify as exact
+matches.
 
 | Contract | Address |
 | --- | --- |
-| PairPadLaunchFactory | `0xCE7EF2465E59443CAEB3A2c5fb969A2d3A9a4bd6` |
-| PairPadRouter | `0x02CB119ba29f48d606fB68e9bC5330AE9A261596` |
-| PairPadLaunchLocker | `0x8d519cC4343079F774ec316B4d84860de71E8F58` |
-| PairPadFeeEscrow | `0x4f834Cabf80062f82BEb17B348d975B6acC03375` |
-| PairPadQuotePricer | `0x0a8326E90B7dcd588399bB6A391F277d76DC7374` |
-| PairPadPositionMinter | `0x68d0b4825F58fD5Ef777739A39765F759c7ef877` |
-| PairPadLaunchDeployer | `0xB9Abd5326867ac5B6C28c767d20E2058C7447e3b` |
-| PonsReferenceRegistry | `0x6937B1fc81e53E31c94285433435cB02db5474ca` |
-| PairPadReferenceRegistry | `0x2D048DD9b2399986E837A5B83e94EB52094Bf078` |
+| PairPadLaunchFactory | `0x9d33Ba78389c8772bC114Cba47Dc1985E933e76F` |
+| PairPadRouter | `0x73d84bdbB1983Fa7eD8FCBcE40bc308997cEd120` |
+| PairPadLaunchLocker | `0x8a6d37B2E6a2AC7970eF69d2932757F04be0A231` |
+| PairPadFeeEscrow | `0x1C27e8F0c2a754DB23ab1608fA09c068D54d4386` |
+| PairPadQuotePricer | `0x9EfC6EFA4c5F31e2BEC6CC174Ba7bB8f0b57d563` |
+| PairPadPositionMinter | `0xDaB26Bb66F29863F2d68CeD54F65cC614c4e65dC` |
+| PairPadLaunchDeployer | `0x916C53ae4738196394C2661c5B0C71B84F40e36C` |
+| PairPadReferenceRegistry | `0x200EAEa1901407F48eBEaFFCF3aA89E75CA1303B` |
+| PonsReferenceRegistry | `0x8a86940B81A9ae6b94011BaFacB121eA2751C890` |
+| PairPadMultiLaunchFactory | `0x3ea29975a79900179F3e1aEF93347Ba4210c29C1` |
+| PairPadMultiRouter | `0x458D2a59c2F3dd32775a64eE72004561440d64Df` |
+| PairPadMultiLaunchLocker | `0x5826FBB6201DaAcD924A3d292841DA9142952D59` |
+| PairPadMultiPositionMinter | `0x643C08DD4571Ba24c600e622a9982001D1A05Be4` |
+| PairPadLaunchDeployer (multi) | `0x752b04277c1EDF6C1b3Cc81d4F9216d1aF1CaCE9` |
+| PairPadMultiReferenceRegistry | `0x616AFc11dbb8c3C4EE719DCEfB645855070101D6` |
+
+The multi-market stack shares the fee escrow and the quote pricer above.
 
 Owner and protocol fee recipient: `0x6053FC7a871AF434F5F26701B206469bAcB03966`. The keeper
 that calls `collectFees` runs from `0x0071aC8dBf95770C089fBd52af4Bd5A63293b040`; the call is
@@ -209,6 +284,14 @@ The `mainnet-*.ps1` scripts in `contracts` wrap the deploy, the ownership accept
 Sourcify verification; they read keys and the RPC URL from `contracts/.env.mainnet`, which is
 not committed. `script/SmokeLaunch.s.sol` launches and trades a token against a live
 deployment and prints the fees the position earned.
+
+The multi-market stack has its own scripts: `script/DeployMulti.s.sol` deploys the factory,
+locker, minter, router and reference registry next to an existing escrow and pricer,
+`script/WireMulti.s.sol` registers the new registry with the pricer and opens launching,
+`script/LaunchMulti.s.sol` and `script/TradeMulti.s.sol` exercise a live deployment, and
+`script/LocalMultiDemo.s.sol` runs the whole lifecycle on an anvil fork.
+`test/fork/MultiLifecycle.fork.t.sol` covers launching, buying and selling across markets,
+the atomic opening buy and per-market fee collection on a mainnet fork.
 
 ## Security
 

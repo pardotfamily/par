@@ -12,10 +12,12 @@ import {PairPadLaunchFactory} from "../src/v2/PairPadLaunchFactory.sol";
 import {PairPadQuotePricer} from "../src/v2/PairPadQuotePricer.sol";
 import {PairPadRouter} from "../src/v2/PairPadRouter.sol";
 import {PairPadLauncherToken} from "../src/v2/PairPadLauncherToken.sol";
+import {Hop} from "../src/v2/libraries/Hop.sol";
 
 /**
  * @notice Exercises the deployed router against a quote that only trades on
- * Uniswap V4: launch with an ETH-paid dev buy, buy again, sell back to ETH.
+ * Uniswap V4 or sits several hops from ETH: launch with an ETH-paid dev buy,
+ * buy again, sell back to ETH.
  * Meant to run as a simulation (no --broadcast) against the live RPC:
  *
  *   FACTORY=... ROUTER=... QUOTE=0x66e7...2c68 forge script script/DryRunV4Zap.s.sol --rpc-url robinhood
@@ -29,13 +31,14 @@ contract DryRunV4Zap is Script {
         address quote = vm.envAddress("QUOTE");
         PairPadQuotePricer pricer = factory.quotePricer();
 
-        (PairPadQuotePricer.Reference memory direct,,) = pricer.describe(quote);
-        require(direct.qualifies, "quote not priceable");
-        require(direct.kind == PairPadQuotePricer.ReferenceKind.V4 && direct.anchor == address(0), "not a V4 ETH ref");
-        PoolKey[] memory hops = new PoolKey[](1);
-        hops[0] = direct.v4Key;
-        PairPadRouter.EthLeg memory leg = PairPadRouter.EthLeg("", hops);
-        console2.log("reference V4 pool depth (wei):", direct.anchorDepth);
+        // The pricer's route runs quote -> ETH; a buy walks it backwards.
+        (Hop[] memory sellLeg, bool qualifies) = pricer.route(quote);
+        require(qualifies, "quote not priceable");
+        Hop[] memory leg = new Hop[](sellLeg.length);
+        for (uint256 i = 0; i < sellLeg.length; i++) {
+            leg[i] = sellLeg[sellLeg.length - 1 - i];
+        }
+        console2.log("route hops:", sellLeg.length);
 
         PairPadLaunchFactory.TokenParams memory params = PairPadLaunchFactory.TokenParams({
             name: "Dry Run",
@@ -66,7 +69,7 @@ contract DryRunV4Zap is Script {
 
         bool tokenIs0 = Currency.unwrap(poolKey.currency0) == token;
         IERC20(token).approve(address(router), out2);
-        uint256 ethOut = router.sellToEth(poolKey, tokenIs0, out2, leg, 0, me);
+        uint256 ethOut = router.sellToEth(poolKey, tokenIs0, out2, sellLeg, 0, me);
         console2.log("sold second buy, ETH out", ethOut);
         vm.stopBroadcast();
 

@@ -47,22 +47,24 @@ contract QuotePricerV4ForkTest is Test {
     function test_ponsGraduate_pricedThroughRegistry_noRegistration() public {
         if (block.chainid != 4663) return;
 
-        (PairPadQuotePricer.Reference memory direct,,) = pricer.describe(VOXEL);
-        assertEq(uint8(direct.kind), uint8(PairPadQuotePricer.ReferenceKind.V4));
-        assertEq(direct.anchor, address(0));
-        assertEq(Currency.unwrap(direct.v4Key.currency1), VOXEL);
-        assertEq(address(direct.v4Key.hooks), PONS_HOOK);
-        console2.log("VOXEL/ETH in-range ETH depth (wei):", direct.anchorDepth);
-        console2.log("floor (wei):", direct.anchorFloor);
+        PairPadQuotePricer.PathReport memory rep = pricer.describe(VOXEL);
+        assertEq(rep.hops.length, 1);
+        PairPadQuotePricer.HopReport memory direct = rep.hops[0];
+        assertFalse(direct.hop.v3);
+        assertEq(direct.tokenOut, address(0));
+        assertEq(Currency.unwrap(direct.hop.key.currency1), VOXEL);
+        assertEq(address(direct.hop.key.hooks), PONS_HOOK);
+        console2.log("VOXEL/ETH in-range ETH depth (wei):", direct.depth);
+        console2.log("floor (wei):", direct.floor);
 
-        if (!direct.qualifies) {
+        if (!rep.qualifies) {
             console2.log("VOXEL pool under the floor at this block; checking the revert path only");
             assertFalse(pricer.isPriceable(VOXEL));
             return;
         }
         assertTrue(pricer.isPriceable(VOXEL));
 
-        (uint160 sqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(direct.v4Key.toId());
+        (uint160 sqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(direct.hop.key.toId());
         uint256 ratioX192 = uint256(sqrtPriceX96) * sqrtPriceX96;
         uint256 spot = FullMath.mulDiv(ratioX192, 4.2 ether, 1 << 192);
         uint256 phantom = pricer.quoteEconomics(VOXEL, 1.3557 ether);
@@ -74,10 +76,11 @@ contract QuotePricerV4ForkTest is Test {
 
     function test_usdgLeg_fromV3() public {
         if (block.chainid != 4663) return;
-        (, PairPadQuotePricer.Reference memory usdgLeg,) = pricer.describe(USDG);
-        console2.log("USDG/ETH reference kind:", uint8(usdgLeg.kind));
-        console2.log("USDG/ETH anchor depth (wei):", usdgLeg.anchorDepth);
-        if (usdgLeg.qualifies) {
+        PairPadQuotePricer.PathReport memory rep = pricer.describe(USDG);
+        assertEq(rep.hops.length, 1);
+        console2.log("USDG/ETH reference is V3:", rep.hops[0].hop.v3);
+        console2.log("USDG/ETH anchor depth (wei):", rep.hops[0].depth);
+        if (rep.qualifies) {
             uint256 usdgFor1Eth = pricer.priceEthAmountInQuote(USDG, 1 ether);
             console2.log("1 ETH in USDG (6 dp):", usdgFor1Eth);
             assertGt(usdgFor1Eth, 500e6);

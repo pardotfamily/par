@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console2} from "forge-std/Test.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
@@ -27,6 +27,7 @@ import {PairPadPositionMinter} from "../../src/v2/PairPadPositionMinter.sol";
 import {LaunchDeployment, PairPadLaunchDeployer} from "../../src/v2/PairPadLaunchDeployer.sol";
 import {PairPadRouter, ISwapRouter02, IWETH9} from "../../src/v2/PairPadRouter.sol";
 import {PairPadLauncherToken} from "../../src/v2/PairPadLauncherToken.sol";
+import {Hop} from "../../src/v2/libraries/Hop.sol";
 import {IPairPadFeeEscrow, IPairPadLaunchFactory} from "../../src/v2/interfaces/ILaunchpadV2.sol";
 
 /**
@@ -132,6 +133,10 @@ contract LifecycleForkTest is Test {
     address constant PONS_FACTORY = 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e;
     /// @dev A PONS graduate whose only real market is its V4 ETH pool.
     address constant BLOKKS = 0x66e73ef65528Baf192679222c6D2810D7D7e2c68;
+    /// @dev SpaceX stock token; deep V3 pools against USDG and WETH.
+    address constant SPCX = 0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa;
+    /// @dev A PONS launch quoted in SPCX, so two pools away from ETH.
+    address constant ROCKET = 0x6B12ec435f15F823ee3C550e9013123e4187429B;
 
     uint256 constant SUPPLY = 1_000_000_000 ether;
     uint256 constant PHANTOM = 1.3557 ether;
@@ -420,12 +425,17 @@ contract LifecycleForkTest is Test {
         assertApproxEqAbs(feeEscrow.balanceOf(creator), 0.03 ether, 1e9);
         assertEq(address(locker).balance, 0, "locker keeps nothing");
 
-        // Sells pay their fee in the token, split the same way.
+        // Sells pay their fee in the token, split the same way, except that
+        // the protocol's share is burned rather than paid.
         _sellEth(key, token, buyer, tokensOut);
         (, uint256 tokenFees) = locker.pendingFees(token);
         assertApproxEqRel(tokenFees, tokensOut / 50, 0.001e18);
+        uint256 supplyBefore = IERC20(token).totalSupply();
+        vm.expectEmit(true, false, false, false, address(locker));
+        emit PairPadLaunchLocker.ProtocolShareBurned(token, 0);
         locker.collectFees(token);
-        assertApproxEqRel(IERC20(token).balanceOf(protocolFees), tokensOut / 200, 0.001e18);
+        assertApproxEqRel(supplyBefore - IERC20(token).totalSupply(), tokensOut / 200, 0.001e18, "protocol share burned");
+        assertEq(IERC20(token).balanceOf(protocolFees), 0, "protocol never holds the launch token");
         assertEq(feeEscrow.balanceOfToken(protocolFees, token), 0);
         assertApproxEqRel(feeEscrow.balanceOfToken(creator, token), tokensOut * 3 / 200, 0.001e18);
         assertEq(IERC20(token).balanceOf(address(locker)), dustAtLaunch, "locker forwards every collected token");
@@ -504,10 +514,8 @@ contract LifecycleForkTest is Test {
         assertEq(factory.getLaunchedToken(token).phantomQuote, phantomUsdg);
 
         bool quoteIs0 = Currency.unwrap(key.currency0) == USDG;
-        PairPadRouter.EthLeg memory buyLeg =
-            PairPadRouter.EthLeg(abi.encodePacked(WETH, uint24(500), USDG), new PoolKey[](0));
-        PairPadRouter.EthLeg memory sellLeg =
-            PairPadRouter.EthLeg(abi.encodePacked(USDG, uint24(500), WETH), new PoolKey[](0));
+        Hop[] memory buyLeg = _v3Leg(WETH, USDG, 500);
+        Hop[] memory sellLeg = buyLeg;
 
         vm.prank(buyer);
         uint256 tokensOut = router.buyWithEth{value: 1 ether}(key, buyLeg, 0, buyer);
@@ -529,16 +537,17 @@ contract LifecycleForkTest is Test {
         (uint256 f0, uint256 f1) = locker.pendingFees(token);
         assertGt(f0, 0);
         assertGt(f1, 0);
+        uint256 supplyBefore = IERC20(token).totalSupply();
         locker.collectFees(token);
         assertGt(feeEscrow.balanceOfToken(creator, USDG), 0);
         assertGt(IERC20(USDG).balanceOf(protocolFees), 0);
         assertGt(feeEscrow.balanceOfToken(creator, token), 0);
-        assertGt(IERC20(token).balanceOf(protocolFees), 0);
+        assertEq(IERC20(token).balanceOf(protocolFees), 0);
+        assertLt(IERC20(token).totalSupply(), supplyBefore, "protocol's token share is burned");
     }
 
     function test_fork_launchAndBuyWithEth_atomicOpeningBuy() public onlyFork {
-        PairPadRouter.EthLeg memory leg =
-            PairPadRouter.EthLeg(abi.encodePacked(WETH, uint24(500), USDG), new PoolKey[](0));
+        Hop[] memory leg = _v3Leg(WETH, USDG, 500);
 
         vm.prank(creator);
         (address token,, uint256 tokensOut) =
@@ -555,7 +564,7 @@ contract LifecycleForkTest is Test {
     function test_fork_launchAndBuy_nativeQuote() public onlyFork {
         vm.prank(creator);
         (address token,, uint256 tokensOut) = router.launchAndBuyWithEth{value: 0.5 ether}(
-            _params("zap-native"), 0, address(0), PairPadRouter.EthLeg("", new PoolKey[](0)), 0
+            _params("zap-native"), 0, address(0), new Hop[](0), 0
         );
         assertGt(tokensOut, 0);
         assertEq(IERC20(token).balanceOf(creator), tokensOut);
@@ -569,19 +578,47 @@ contract LifecycleForkTest is Test {
 
     /// @dev The pricer's chosen reference for BLOKKS is a V4 ETH pool; the
     /// same key is the zap's hop, so ETH -> BLOKKS -> token runs in one unlock.
-    function _blokksLeg() internal view returns (PairPadRouter.EthLeg memory leg, PoolKey memory ref) {
-        (PairPadQuotePricer.Reference memory direct,,) = quotePricer.describe(BLOKKS);
-        assertTrue(direct.qualifies, "BLOKKS priceable");
-        assertEq(uint8(direct.kind), uint8(PairPadQuotePricer.ReferenceKind.V4));
-        assertEq(direct.anchor, address(0), "native ETH anchor");
-        ref = direct.v4Key;
-        PoolKey[] memory hops = new PoolKey[](1);
-        hops[0] = ref;
-        leg = PairPadRouter.EthLeg("", hops);
+    function _blokksLeg() internal view returns (Hop[] memory leg, PoolKey memory ref) {
+        PairPadQuotePricer.PathReport memory rep = quotePricer.describe(BLOKKS);
+        assertTrue(rep.qualifies, "BLOKKS priceable");
+        assertEq(rep.hops.length, 1);
+        assertFalse(rep.hops[0].hop.v3);
+        assertEq(rep.hops[0].tokenOut, address(0), "native ETH anchor");
+        ref = rep.hops[0].hop.key;
+        leg = new Hop[](1);
+        leg[0] = rep.hops[0].hop;
+    }
+
+    /// @dev A V3 pair as a one-hop leg; the router walks it either way.
+    function _v3Leg(address a, address b, uint24 fee) internal pure returns (Hop[] memory leg) {
+        (address c0, address c1) = a < b ? (a, b) : (b, a);
+        leg = new Hop[](1);
+        leg[0] = Hop({
+            key: PoolKey({
+                currency0: Currency.wrap(c0),
+                currency1: Currency.wrap(c1),
+                fee: fee,
+                tickSpacing: 0,
+                hooks: IHooks(address(0))
+            }),
+            v3: true
+        });
+    }
+
+    /// @dev The pricer's route reversed: the pricer walks quote -> ETH, a buy
+    /// walks ETH -> quote.
+    function _buyLegFor(address quote) internal view returns (Hop[] memory buyLeg, Hop[] memory sellLeg) {
+        bool qualifies;
+        (sellLeg, qualifies) = quotePricer.route(quote);
+        assertTrue(qualifies, "quote priceable");
+        buyLeg = new Hop[](sellLeg.length);
+        for (uint256 i = 0; i < sellLeg.length; i++) {
+            buyLeg[i] = sellLeg[sellLeg.length - 1 - i];
+        }
     }
 
     function test_fork_v4Quote_launchAndBuyThenRoundTrip() public onlyFork {
-        (PairPadRouter.EthLeg memory leg,) = _blokksLeg();
+        (Hop[] memory leg,) = _blokksLeg();
 
         // Opening buy paid in ETH through the BLOKKS pool, no BLOKKS held.
         assertEq(IERC20(BLOKKS).balanceOf(creator), 0);
@@ -618,6 +655,91 @@ contract LifecycleForkTest is Test {
         router.buyWithEth{value: 0.01 ether}(key, leg, type(uint256).max, buyer);
     }
 
+    // -------------------------------------------------------------------
+    // Quote several hops from ETH: a PONS token quoted in a stock token
+    // -------------------------------------------------------------------
+
+    /// @dev The route the interface would find and register for ROCKET:
+    /// ROCKET/SPCX on V4 (PONS hook), SPCX/USDG 0.05% on V3, USDG/WETH 0.05%
+    /// on V3. Three hops, V4 first then V3, which the old leg shape could
+    /// not express.
+    function _rocketRoute() internal view returns (Hop[] memory hops) {
+        (bool found, PoolKey memory rocketKey) =
+            PonsReferenceRegistry(address(quotePricer.registries(0))).referencePool(ROCKET);
+        assertTrue(found, "ROCKET is a PONS launch");
+        hops = new Hop[](3);
+        hops[0] = Hop({key: rocketKey, v3: false});
+        hops[1] = _v3Leg(SPCX, USDG, 500)[0];
+        hops[2] = _v3Leg(USDG, WETH, 500)[0];
+    }
+
+    function test_fork_deepQuote_registeredRoutePricesAndTrades() public onlyFork {
+        // No direct or USDG pool for ROCKET is deep enough on its own.
+        assertFalse(quotePricer.isPriceable(ROCKET), "not priceable before a route is registered");
+        vm.expectRevert();
+        vm.prank(creator);
+        factory.launchToken(_params("deep-fail"), 0, ROCKET);
+
+        Hop[] memory hops = _rocketRoute();
+        PairPadQuotePricer.PathReport memory rep = quotePricer.evaluatePath(ROCKET, hops);
+        for (uint256 i = 0; i < rep.hops.length; i++) {
+            console2.log("hop", i, "depth", rep.hops[i].depth);
+            console2.log("hop", i, "floor", rep.hops[i].floor);
+        }
+        if (!rep.qualifies) {
+            console2.log("ROCKET route under the floor at this block; skipping the trade half");
+            return;
+        }
+
+        vm.prank(other);
+        quotePricer.registerPath(ROCKET, hops);
+        assertTrue(quotePricer.isPriceable(ROCKET));
+        uint256 phantom = quotePricer.priceEthAmountInQuote(ROCKET, PHANTOM);
+        assertGt(phantom, 0);
+        console2.log("1.3557 ETH in ROCKET:", phantom);
+
+        // Launch quoted in ROCKET with an ETH-paid opening buy that walks
+        // ETH -> USDG (V3) -> SPCX (V3) -> ROCKET (V4, PONS hook) -> token.
+        (Hop[] memory buyLeg, Hop[] memory sellLeg) = _buyLegFor(ROCKET);
+        assertEq(buyLeg.length, 3);
+        assertTrue(buyLeg[0].v3);
+        assertFalse(buyLeg[2].v3);
+
+        vm.prank(creator);
+        (address token,, uint256 opening) =
+            router.launchAndBuyWithEth{value: 0.2 ether}(_params("deep"), 0, ROCKET, buyLeg, 0);
+        assertGt(opening, 0);
+        assertEq(IERC20(token).balanceOf(creator), opening);
+        assertEq(factory.getLaunchedToken(token).phantomQuote, phantom);
+        assertEq(IERC20(ROCKET).balanceOf(address(router)), 0, "router keeps no ROCKET");
+        assertEq(IERC20(SPCX).balanceOf(address(router)), 0, "router keeps no SPCX");
+        assertEq(IERC20(USDG).balanceOf(address(router)), 0, "router keeps no USDG");
+        assertEq(address(router).balance, 0, "router keeps no ETH");
+
+        PoolKey memory key = factory.poolKeyFor(token);
+        bool tokenIs0 = Currency.unwrap(key.currency0) == token;
+
+        vm.prank(buyer);
+        uint256 tokensOut = router.buyWithEth{value: 0.1 ether}(key, buyLeg, 0, buyer);
+        assertGt(tokensOut, 0);
+        assertEq(IERC20(ROCKET).balanceOf(buyer), 0, "buyer never touched the quote");
+
+        uint256 ethBefore = buyer.balance;
+        vm.startPrank(buyer);
+        IERC20(token).approve(address(router), tokensOut);
+        uint256 ethOut = router.sellToEth(key, tokenIs0, tokensOut, sellLeg, 0, buyer);
+        vm.stopPrank();
+        assertEq(buyer.balance, ethBefore + ethOut);
+        // Three hops each way plus the launch pool and price impact on a
+        // 0.1 ETH trade against thin pools: most of it comes back.
+        assertGt(ethOut, 0.06 ether);
+        console2.log("0.1 ETH round trip through four pools returned (wei):", ethOut);
+        assertEq(IERC20(ROCKET).balanceOf(address(router)), 0);
+        assertEq(IERC20(SPCX).balanceOf(address(router)), 0);
+        assertEq(IERC20(USDG).balanceOf(address(router)), 0);
+        assertEq(address(router).balance, 0);
+    }
+
     function test_fork_v4Quote_brokenHopReverts() public onlyFork {
         (, PoolKey memory ref) = _blokksLeg();
         vm.prank(creator);
@@ -625,16 +747,16 @@ contract LifecycleForkTest is Test {
         PoolKey memory key = factory.poolKeyFor(token);
 
         // ETH -> BLOKKS -> ETH, then the launch pool has no ETH side.
-        PoolKey[] memory hops = new PoolKey[](2);
-        hops[0] = ref;
-        hops[1] = ref;
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop({key: ref, v3: false});
+        hops[1] = Hop({key: ref, v3: false});
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(PairPadRouter.RouteBroken.selector, 2));
-        router.buyWithEth{value: 0.01 ether}(key, PairPadRouter.EthLeg("", hops), 0, buyer);
+        router.buyWithEth{value: 0.01 ether}(key, hops, 0, buyer);
 
         // Claiming ETH comes out where BLOKKS does.
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(PairPadRouter.RouteBroken.selector, 0));
-        router.buyWithEth{value: 0.01 ether}(key, PairPadRouter.EthLeg("", new PoolKey[](0)), 0, buyer);
+        router.buyWithEth{value: 0.01 ether}(key, new Hop[](0), 0, buyer);
     }
 }
