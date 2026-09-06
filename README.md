@@ -12,7 +12,9 @@ becomes tradable under one address (see "Multi-market launches").
 This repository holds the protocol: Solidity sources, tests, deploy scripts and the mainnet
 addresses. The interface, indexer and keeper are operated by the team and are not part of this
 repository; everything they do can be reproduced from the contracts and events described here.
-The docs on the site cover the same surface plus the public indexer API.
+The docs on the site cover the same surface plus the public indexer API. A TypeScript SDK that
+wraps it (launch discovery, pool resolution, ETH-routed trades across every market of a token,
+event decoding, indexer client) is at [github.com/pardotfamily/par-sdk](https://github.com/pardotfamily/par-sdk).
 
 ## How a launch works on chain
 
