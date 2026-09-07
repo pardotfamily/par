@@ -47,9 +47,12 @@ event decoding, indexer client) is at [github.com/pardotfamily/par-sdk](https://
    does it too.
 6. Where the shares go from there (`contracts/src/fees`, no owners, nothing configurable):
    - `PairPadFeeSplitter` is the protocol fee recipient of every launch created since it was
-     set. Anyone may `flush` it: 80% of each asset to the buyback wallet, which turns it into ETH,
-     buys $par in the $par pool and burns it; 20% to the protocol wallet. Older launches keep
-     the recipient frozen in their record.
+     set. Anyone may `flush` it: `buybackBps` (60%) of each asset to the buyback wallet, which
+     turns it into ETH, buys $par in the $par pool and burns it; the rest to the protocol wallet.
+     With the token-side share burned outright, 80% of what the protocol earns on these launches
+     is burned or bought back. Launch fees sent by the factories pass straight through to the
+     protocol wallet. Launches keep the recipient frozen in their record: the first splitter
+     (80/20) keeps receiving from the launches made under it, older launches never pay one.
    - `PairPadHolderVault` is the creator fee recipient a launch may name at creation to give the
      creator's share to the token's holders ("fees to holders"). Only a recipient can change a
      launch's recipient and the vault has no such function, so it is permanent. Anyone may
