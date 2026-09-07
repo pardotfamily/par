@@ -25,6 +25,8 @@ contract FeesTest is Test {
     address internal buybackWallet = makeAddr("buyback");
     address internal treasury = makeAddr("treasury");
     address internal distributor = makeAddr("distributor");
+    address internal factory = makeAddr("factory");
+    address internal multiFactory = makeAddr("multiFactory");
 
     PairPadFeeSplitter internal splitter;
     PairPadHolderVault internal vault;
@@ -34,7 +36,7 @@ contract FeesTest is Test {
         escrow = new PairPadFeeEscrow();
         usdg = new MockERC20("USDG", "USDG", 6);
         launchToken = new MockERC20("Launch", "LNCH", 18);
-        splitter = new PairPadFeeSplitter(buybackWallet, treasury, 8000);
+        splitter = new PairPadFeeSplitter(buybackWallet, treasury, 6000, factory, multiFactory);
         vault = new PairPadHolderVault(IPairPadFeeEscrow(address(escrow)), distributor);
         disperse = new PairPadDisperse();
         vm.deal(address(this), 100 ether);
@@ -44,11 +46,18 @@ contract FeesTest is Test {
 
     function test_splitter_constructorGuards() public {
         vm.expectRevert(PairPadFeeSplitter.ZeroAddress.selector);
-        new PairPadFeeSplitter(address(0), treasury, 8000);
+        new PairPadFeeSplitter(address(0), treasury, 6000, factory, multiFactory);
+        vm.expectRevert(PairPadFeeSplitter.ZeroAddress.selector);
+        new PairPadFeeSplitter(buybackWallet, treasury, 6000, address(0), multiFactory);
+        vm.expectRevert(PairPadFeeSplitter.ZeroAddress.selector);
+        new PairPadFeeSplitter(buybackWallet, treasury, 6000, factory, address(0));
         vm.expectRevert(PairPadFeeSplitter.InvalidShare.selector);
-        new PairPadFeeSplitter(buybackWallet, treasury, 0);
+        new PairPadFeeSplitter(buybackWallet, treasury, 0, factory, multiFactory);
         vm.expectRevert(PairPadFeeSplitter.InvalidShare.selector);
-        new PairPadFeeSplitter(buybackWallet, treasury, 10_001);
+        new PairPadFeeSplitter(buybackWallet, treasury, 10_001, factory, multiFactory);
+        assertEq(splitter.buybackBps(), 6000);
+        assertEq(splitter.factory(), factory);
+        assertEq(splitter.multiFactory(), multiFactory);
     }
 
     function test_splitter_receivesUnder50kGasAndFlushesEth() public {
@@ -58,18 +67,43 @@ contract FeesTest is Test {
         assertEq(address(splitter).balance, 1 ether);
 
         (uint256 a, uint256 b) = splitter.flush(address(0));
-        assertEq(a, 0.8 ether);
-        assertEq(b, 0.2 ether);
-        assertEq(buybackWallet.balance, 0.8 ether);
-        assertEq(treasury.balance, 0.2 ether);
+        assertEq(a, 0.6 ether);
+        assertEq(b, 0.4 ether);
+        assertEq(buybackWallet.balance, 0.6 ether);
+        assertEq(treasury.balance, 0.4 ether);
         assertEq(address(splitter).balance, 0);
+    }
+
+    function test_splitter_forwardsLaunchFeeFromFactoriesToTreasury() public {
+        // Native ETH from either factory is a launch fee: straight to the treasury, not split.
+        vm.deal(factory, 1 ether);
+        vm.deal(multiFactory, 1 ether);
+        vm.prank(factory);
+        (bool ok,) = address(splitter).call{value: 0.0005 ether}("");
+        assertTrue(ok);
+        vm.prank(multiFactory);
+        (ok,) = address(splitter).call{value: 0.0005 ether}("");
+        assertTrue(ok);
+        assertEq(treasury.balance, 0.001 ether);
+        assertEq(address(splitter).balance, 0);
+        assertEq(buybackWallet.balance, 0);
+    }
+
+    function test_splitter_launchFeeStaysWhenTreasuryRejects_launchDoesNotRevert() public {
+        RejectsEth bad = new RejectsEth();
+        PairPadFeeSplitter s = new PairPadFeeSplitter(buybackWallet, address(bad), 6000, factory, multiFactory);
+        vm.deal(factory, 1 ether);
+        vm.prank(factory);
+        (bool ok,) = address(s).call{value: 0.0005 ether}("");
+        assertTrue(ok); // the factory's transfer succeeds regardless
+        assertEq(address(s).balance, 0.0005 ether); // waits for a flush
     }
 
     function test_splitter_flushesErc20AndRounding() public {
         usdg.mint(address(splitter), 1_000_001);
         splitter.flush(address(usdg));
-        assertEq(usdg.balanceOf(buybackWallet), 800_000); // floor of 80%
-        assertEq(usdg.balanceOf(treasury), 200_001); // remainder, nothing stranded
+        assertEq(usdg.balanceOf(buybackWallet), 600_000); // floor of 60%
+        assertEq(usdg.balanceOf(treasury), 400_001); // remainder, nothing stranded
         assertEq(usdg.balanceOf(address(splitter)), 0);
     }
 
@@ -88,15 +122,15 @@ contract FeesTest is Test {
         assets[0] = address(0);
         assets[1] = address(usdg);
         splitter.flushMany(assets);
-        assertEq(buybackWallet.balance, 8);
-        assertEq(treasury.balance, 2);
-        assertEq(usdg.balanceOf(buybackWallet), 400);
-        assertEq(usdg.balanceOf(treasury), 100);
+        assertEq(buybackWallet.balance, 6);
+        assertEq(treasury.balance, 4);
+        assertEq(usdg.balanceOf(buybackWallet), 300);
+        assertEq(usdg.balanceOf(treasury), 200);
     }
 
     function test_splitter_revertsIfRecipientRejectsEth() public {
         RejectsEth bad = new RejectsEth();
-        PairPadFeeSplitter s = new PairPadFeeSplitter(address(bad), treasury, 8000);
+        PairPadFeeSplitter s = new PairPadFeeSplitter(address(bad), treasury, 6000, factory, multiFactory);
         (bool ok,) = address(s).call{value: 1 ether}("");
         assertTrue(ok);
         vm.expectRevert(abi.encodeWithSelector(PairPadFeeSplitter.NativeTransferFailed.selector, address(bad)));

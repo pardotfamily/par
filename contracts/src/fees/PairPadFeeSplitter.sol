@@ -12,41 +12,64 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  * fees (native ETH and ERC-20s alike), and anyone may split what has
  * arrived: `buybackBps` to the buyback wallet, the rest to the treasury.
  *
- * There is no owner and nothing to configure: the two addresses and the
+ * The factories also send the launch fee to the protocol fee recipient. That
+ * fee is the treasury's whole: when the sender of native ETH is one of the
+ * factories, `receive` forwards it straight to the treasury instead of
+ * leaving it for the split. Should the forward fail, the ETH simply stays
+ * and goes out with the next flush; a launch never reverts because of it.
+ *
+ * There is no owner and nothing to configure: the addresses and the
  * proportion are fixed at deployment. Changing the split means deploying a
  * new splitter and pointing the factories at it, which is visible on chain
  * as `ProtocolFeeRecipientUpdated`.
  *
- * Receiving is kept trivial so the lockers' 50k-gas native transfer never
- * fails; the split itself happens in `flush`, paid by whoever calls it.
+ * Receiving from the lockers stays trivial (two address compares) so their
+ * 50k-gas native transfer never fails; the split itself happens in `flush`,
+ * paid by whoever calls it.
  */
 contract PairPadFeeSplitter {
     using SafeERC20 for IERC20;
 
     uint256 public constant BASIS_POINTS = 10_000;
 
-    /// @notice Receives `buybackBps` of every asset; buys back and burns $par.
+    /// @notice Receives `buybackBps` of every flushed asset; buys back and burns $par.
     address public immutable buyback;
-    /// @notice Receives the remainder; protocol operations.
+    /// @notice Receives the remainder of every flush and the launch fees; protocol operations.
     address public immutable treasury;
     /// @notice Share of every flush that goes to `buyback`, in basis points.
     uint16 public immutable buybackBps;
+    /// @notice The single-market factory; its native transfers are launch fees.
+    address public immutable factory;
+    /// @notice The multi-market factory; its native transfers are launch fees.
+    address public immutable multiFactory;
 
     event Flushed(address indexed asset, uint256 toBuyback, uint256 toTreasury);
+    /// @notice A launch fee from a factory passed through to the treasury.
+    event LaunchFeeForwarded(address indexed factory, uint256 amount);
 
     error ZeroAddress();
     error InvalidShare();
     error NativeTransferFailed(address to);
 
-    constructor(address buyback_, address treasury_, uint16 buybackBps_) {
+    constructor(address buyback_, address treasury_, uint16 buybackBps_, address factory_, address multiFactory_) {
         if (buyback_ == address(0) || treasury_ == address(0)) revert ZeroAddress();
+        if (factory_ == address(0) || multiFactory_ == address(0)) revert ZeroAddress();
         if (buybackBps_ == 0 || buybackBps_ > BASIS_POINTS) revert InvalidShare();
         buyback = buyback_;
         treasury = treasury_;
         buybackBps = buybackBps_;
+        factory = factory_;
+        multiFactory = multiFactory_;
     }
 
-    receive() external payable {}
+    receive() external payable {
+        if (msg.sender == factory || msg.sender == multiFactory) {
+            // Launch fee: the treasury's, whole. The factories call with full
+            // gas, so the forward fits; if it fails the ETH waits for a flush.
+            (bool ok,) = treasury.call{value: msg.value}("");
+            if (ok) emit LaunchFeeForwarded(msg.sender, msg.value);
+        }
+    }
 
     /**
      * @notice Splits this contract's whole balance of `asset` (address zero

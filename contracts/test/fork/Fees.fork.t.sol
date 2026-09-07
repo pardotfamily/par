@@ -56,7 +56,7 @@ contract FeesForkTest is Test {
 
     function setUp() public {
         if (block.chainid != 4663) return;
-        splitter = new PairPadFeeSplitter(buybackWallet, treasury, 8000);
+        splitter = new PairPadFeeSplitter(buybackWallet, treasury, 6000, address(factory), MULTI_FACTORY);
         vault = new PairPadHolderVault(IPairPadFeeEscrow(FEE_ESCROW), distributor);
         disperse = new PairPadDisperse();
         vm.deal(creator, 10 ether);
@@ -133,14 +133,14 @@ contract FeesForkTest is Test {
         // 50/50 split: creator's ETH equals protocol's ETH (within rounding).
         assertApproxEqAbs(vaultEth, protocolEth, 2);
 
-        // Flush 80/20. The splitter also holds the launch fee the factory paid
-        // it at creation (the factory pays the current recipient), so the
-        // split covers protocol trading fees and launch fees alike.
+        // The launch fee the factory paid at creation went straight through
+        // to the treasury; only protocol trading fees wait for the flush.
+        assertEq(treasury.balance, factory.launchFee(), "launch fee forwarded to treasury");
         uint256 held = address(splitter).balance;
-        assertEq(held, protocolEth + factory.launchFee());
+        assertEq(held, protocolEth);
         splitter.flush(address(0));
-        assertEq(buybackWallet.balance, (held * 8000) / 10_000);
-        assertEq(treasury.balance, held - (held * 8000) / 10_000);
+        assertEq(buybackWallet.balance, (held * 6000) / 10_000);
+        assertEq(treasury.balance, factory.launchFee() + held - (held * 6000) / 10_000);
         assertEq(address(splitter).balance, 0);
 
         // Harvest to the distributor.
