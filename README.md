@@ -57,8 +57,12 @@ event decoding, indexer client) is at [github.com/pardotfamily/par-sdk](https://
      creator's share to the token's holders ("fees to holders"). Only a recipient can change a
      launch's recipient and the vault has no such function, so it is permanent. Anyone may
      `harvest` it: it claims from the escrow and forwards to the holder-rewards wallet, which
-     buys the token back with the quote part and sends everything to holders pro rata through
-     `PairPadDisperse` (`Dispersed(token, sender, round, total, recipients)`), every hour.
+     pays holders pro rata every hour in the asset the fees came in (the quote on buys, the
+     token on sells; nothing is swapped) through `PairPadDisperseV2`
+     (`Dispersed(launch, asset, sender, round, total, recipients)` per asset, `Paid(launch, asset,
+     to, amount)` per recipient; `asset` is address(0) for ETH). Rounds before September 2026
+     went through `PairPadDisperse`, which paid the token only (`Dispersed(token, sender, round,
+     total, recipients)`).
    - `PairPadBurnVault` is the creator fee recipient a launch may name at creation to give the
      creator's share back to the token ("buyback & burn"). Permanent in the same way. It has no
      owner and no function that moves value anywhere except into the token's own launch pool or

@@ -8,6 +8,7 @@ import {IPairPadFeeEscrow} from "../src/v2/interfaces/ILaunchpadV2.sol";
 import {PairPadFeeSplitter} from "../src/fees/PairPadFeeSplitter.sol";
 import {PairPadHolderVault} from "../src/fees/PairPadHolderVault.sol";
 import {PairPadDisperse} from "../src/fees/PairPadDisperse.sol";
+import {PairPadDisperseV2} from "../src/fees/PairPadDisperseV2.sol";
 import {
     PairPadBurnVault, IPairPadSwapRouter, ISingleLaunchFactory, IMultiLaunchFactory
 } from "../src/fees/PairPadBurnVault.sol";
@@ -111,5 +112,20 @@ contract DeploySplitter is Script {
         console2.log("buyback bps:         ", uint256(buybackBps));
         console2.log("factory:             ", factory);
         console2.log("multi factory:       ", multiFactory);
+    }
+}
+
+/**
+ * @notice Deploys the launch-tagged disperser used once holder rewards are
+ * paid in the asset they were earned in (ETH / the quote, plus the token
+ * side). No constructor arguments, no owner. Env: PRIVATE_KEY.
+ */
+contract DeployDisperseV2 is Script {
+    function run() external {
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        vm.startBroadcast(deployerKey);
+        PairPadDisperseV2 disperse = new PairPadDisperseV2();
+        vm.stopBroadcast();
+        console2.log("PairPadDisperseV2:   ", address(disperse));
     }
 }
