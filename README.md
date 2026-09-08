@@ -59,6 +59,13 @@ event decoding, indexer client) is at [github.com/pardotfamily/par-sdk](https://
      `harvest` it: it claims from the escrow and forwards to the holder-rewards wallet, which
      buys the token back with the quote part and sends everything to holders pro rata through
      `PairPadDisperse` (`Dispersed(token, sender, round, total, recipients)`), every hour.
+   - `PairPadBurnVault` is the creator fee recipient a launch may name at creation to give the
+     creator's share back to the token ("buyback & burn"). Permanent in the same way. It has no
+     owner and no function that moves value anywhere except into the token's own launch pool or
+     to the zero address: anyone may `burnToken` (claims the token-side share from the escrow
+     and burns it); the operator runs `buyback`, which spends the quote-side share buying the
+     token in the pool the factory recorded for that pair (never one named by the caller) and
+     burns what it bought (`BoughtBack(token, quote, quoteIn, tokensOut)`, `Burned(token, amount)`).
 
 There is no snipe tax, no trading delay and no lock on third party liquidity. The dev buy in
 `launchAndBuyWithEth` / `launchAndBuyWithQuote` is the only buy guaranteed to be first, because
