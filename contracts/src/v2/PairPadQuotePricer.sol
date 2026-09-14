@@ -189,8 +189,17 @@ contract PairPadQuotePricer is Ownable2Step {
     address public immutable weth;
     address public immutable usdg;
 
-    /// @notice How much ETH worth of the side nearer ETH every hop of a
-    /// route must hold (V3) or have in range (V4).
+    /**
+     * @notice Whether the chain's native asset (address zero) counts as the
+     * reference alongside `weth`. True on chains where `weth` wraps the gas
+     * token 1:1 (Robinhood Chain). False on Arc, where USDC is the gas token
+     * and its ERC-20 interface is `weth`: the two views of one balance differ
+     * by twelve decimals, so only the ERC-20 side is ever priced or paired.
+     */
+    bool public immutable nativeIsReference;
+
+    /// @notice How much of the reference asset (ETH, or USDC on Arc) the side
+    /// nearer the reference must hold (V3) or have in range (V4) on every hop.
     uint256 public minReferenceEth = 5 ether;
 
     /// @notice Hooks a V4 hop may carry. Address zero (no hook) is allowed
@@ -210,7 +219,8 @@ contract PairPadQuotePricer is Ownable2Step {
         IUniswapV3FactoryMinimal v3Factory_,
         address weth_,
         address usdg_,
-        IPoolManager poolManager_
+        IPoolManager poolManager_,
+        bool nativeIsReference_
     ) Ownable(initialOwner) {
         if (
             address(v3Factory_) == address(0) || weth_ == address(0) || usdg_ == address(0)
@@ -220,6 +230,7 @@ contract PairPadQuotePricer is Ownable2Step {
         weth = weth_;
         usdg = usdg_;
         poolManager = poolManager_;
+        nativeIsReference = nativeIsReference_;
         allowedV4Hooks[address(0)] = true;
         emit V4HookAllowed(address(0), true);
     }
@@ -636,8 +647,9 @@ contract PairPadQuotePricer is Ownable2Step {
         }
     }
 
+    /// @dev Whether `token` is the reference asset: `weth`, or native when the chain wraps its gas token 1:1.
     function _isEth(address token) private view returns (bool) {
-        return token == address(0) || token == weth;
+        return token == weth || (nativeIsReference && token == address(0));
     }
 
     // ---------------------------------------------------------------------

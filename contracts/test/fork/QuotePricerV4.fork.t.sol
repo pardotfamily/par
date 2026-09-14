@@ -38,7 +38,7 @@ contract QuotePricerV4ForkTest is Test {
     function setUp() public {
         if (block.chainid != 4663) return;
         pricer = new PairPadQuotePricer(
-            address(this), IUniswapV3FactoryMinimal(V3_FACTORY), WETH, USDG, IPoolManager(POOL_MANAGER)
+            address(this), IUniswapV3FactoryMinimal(V3_FACTORY), WETH, USDG, IPoolManager(POOL_MANAGER), true
         );
         pricer.setV4HookAllowed(PONS_HOOK, true);
         pricer.addRegistry(new PonsReferenceRegistry(IPonsV2LaunchFactory(PONS_FACTORY), IHooks(PONS_HOOK)));

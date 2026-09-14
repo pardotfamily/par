@@ -91,6 +91,7 @@ contract MultiLifecycleForkTest is Test {
             IPairPadFeeEscrow(FEE_ESCROW),
             quotePricer,
             WETH,
+            true,
             protocolFees,
             0
         );

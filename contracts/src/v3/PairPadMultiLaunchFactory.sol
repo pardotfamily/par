@@ -132,6 +132,7 @@ contract PairPadMultiLaunchFactory is Ownable2Step, ReentrancyGuard, IPairPadMul
     error DuplicatePairToken();
     /// @dev WETH is never a quote here: native ETH is.
     error WethNotAllowed();
+    error NativeNotAllowed();
     error MarketNotFound();
 
     event TokenLaunched(
@@ -185,6 +186,14 @@ contract PairPadMultiLaunchFactory is Ownable2Step, ReentrancyGuard, IPairPadMul
     IPairPadFeeEscrow public immutable feeEscrow;
     PairPadQuotePricer public immutable quotePricer;
     address public immutable weth;
+    /**
+     * @notice Whether native (address zero) is the reference quote and `weth`
+     * only wraps it (Robinhood Chain), or `weth` itself is the reference and
+     * native is never paired (Arc, where `weth` is the ERC-20 face of USDC).
+     * Held here rather than read from the pricer so a factory can sit on a
+     * pricer deployed before the flag existed.
+     */
+    bool public immutable nativeIsReference;
 
     PairPadMultiPositionMinter public positionMinter;
     PairPadLaunchDeployer public launchDeployer;
@@ -213,6 +222,7 @@ contract PairPadMultiLaunchFactory is Ownable2Step, ReentrancyGuard, IPairPadMul
         IPairPadFeeEscrow feeEscrow_,
         PairPadQuotePricer quotePricer_,
         address weth_,
+        bool nativeIsReference_,
         address protocolFeeRecipient_,
         uint256 initialLaunchFee
     ) Ownable(initialOwner) {
@@ -228,6 +238,7 @@ contract PairPadMultiLaunchFactory is Ownable2Step, ReentrancyGuard, IPairPadMul
         feeEscrow = feeEscrow_;
         quotePricer = quotePricer_;
         weth = weth_;
+        nativeIsReference = nativeIsReference_;
         protocolFeeRecipient = protocolFeeRecipient_;
         launchFee = initialLaunchFee;
     }
@@ -632,12 +643,22 @@ contract PairPadMultiLaunchFactory is Ownable2Step, ReentrancyGuard, IPairPadMul
     // Internals
     // ---------------------------------------------------------------------
 
-    /// @dev 1..MAX_MARKETS distinct quote assets, never WETH (native ETH is).
+    /**
+     * @dev 1..MAX_MARKETS distinct quote assets. The reference asset is
+     * quoted through exactly one address: native (address zero) where the
+     * pricer treats native as the reference and `weth` merely wraps it
+     * (Robinhood Chain), the ERC-20 `weth` otherwise (Arc, where `weth` is
+     * the USDC interface and native USDC is never paired).
+     */
     function _validatePairTokens(address[] calldata pairTokens) private view {
         uint256 n = pairTokens.length;
         if (n == 0 || n > MAX_MARKETS) revert InvalidMarketCount();
         for (uint256 i = 0; i < n; i++) {
-            if (pairTokens[i] == weth) revert WethNotAllowed();
+            if (nativeIsReference) {
+                if (pairTokens[i] == weth) revert WethNotAllowed();
+            } else if (pairTokens[i] == address(0)) {
+                revert NativeNotAllowed();
+            }
             for (uint256 j = i + 1; j < n; j++) {
                 if (pairTokens[i] == pairTokens[j]) revert DuplicatePairToken();
             }

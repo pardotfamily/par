@@ -163,7 +163,7 @@ contract LifecycleForkTest is Test {
 
         feeEscrow = new PairPadFeeEscrow();
         quotePricer = new PairPadQuotePricer(
-            address(this), IUniswapV3FactoryMinimal(V3_FACTORY), WETH, USDG, manager
+            address(this), IUniswapV3FactoryMinimal(V3_FACTORY), WETH, USDG, manager, true
         );
         quotePricer.setV4HookAllowed(PONS_HOOK, true);
         quotePricer.addRegistry(new PonsReferenceRegistry(IPonsV2LaunchFactory(PONS_FACTORY), IHooks(PONS_HOOK)));

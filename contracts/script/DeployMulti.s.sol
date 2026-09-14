@@ -59,6 +59,8 @@ contract DeployMulti is Script {
         // Same curve as v2's config 0: 1B supply, 1.3557 ETH opening cap.
         uint256 supply = vm.envOr("LAUNCH_SUPPLY", uint256(1_000_000_000 ether));
         uint256 phantom = vm.envOr("LAUNCH_PHANTOM", uint256(1.3557 ether));
+        // False on Arc (5042 / 5042002): USDC is the gas token, WETH is its ERC-20 interface, native is never paired.
+        bool nativeIsReference = vm.envOr("NATIVE_IS_REFERENCE", block.chainid != 5042 && block.chainid != 5042002);
 
         if (block.chainid == 4663) {
             require(poolManager == RH_POOL_MANAGER, "mainnet: POOL_MANAGER override");
@@ -67,6 +69,7 @@ contract DeployMulti is Script {
             require(weth == RH_WETH, "mainnet: WETH override");
             require(feeEscrow == RH_FEE_ESCROW, "mainnet: FEE_ESCROW override");
             require(quotePricer == RH_QUOTE_PRICER, "mainnet: QUOTE_PRICER override");
+            require(nativeIsReference, "mainnet: NATIVE_IS_REFERENCE override");
         }
 
         vm.startBroadcast(deployerKey);
@@ -82,6 +85,7 @@ contract DeployMulti is Script {
             IPairPadFeeEscrow(feeEscrow),
             PairPadQuotePricer(quotePricer),
             weth,
+            nativeIsReference,
             protocolFeeRecipient,
             launchFee
         );

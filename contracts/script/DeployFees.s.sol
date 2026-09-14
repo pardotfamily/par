@@ -12,6 +12,10 @@ import {PairPadDisperseV2} from "../src/fees/PairPadDisperseV2.sol";
 import {
     PairPadBurnVault, IPairPadSwapRouter, ISingleLaunchFactory, IMultiLaunchFactory
 } from "../src/fees/PairPadBurnVault.sol";
+import {
+    PairPadFloorVault, IFloorSingleFactory, IFloorSingleLocker, IFloorMultiFactory, IFloorMultiLocker
+} from "../src/fees/PairPadFloorVault.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 
 /**
  * @notice Deploys the fee-routing add-ons. None of them has an owner; the
@@ -87,6 +91,42 @@ contract DeployBurnVault is Script {
         console2.log("PairPadBurnVault:    ", address(vault));
         console2.log("operator:            ", operator);
         console2.log("router:              ", router);
+    }
+}
+
+/**
+ * @notice Deploys the floor vault: the creator fee recipient of "price
+ * floor" launches. No owner; the operator (the distributor wallet) can only
+ * attribute stray fees to a launch. Env: PRIVATE_KEY, DISTRIBUTOR, optional
+ * POOL_MANAGER / FEE_ESCROW / FACTORY / LOCKER / MULTI_FACTORY /
+ * MULTI_LOCKER (default mainnet).
+ */
+contract DeployFloorVault is Script {
+    function run() external {
+        uint256 deployerKey = vm.envUint("PRIVATE_KEY");
+        address operator = vm.envAddress("DISTRIBUTOR");
+        address poolManager = vm.envOr("POOL_MANAGER", 0x8366a39CC670B4001A1121B8F6A443A643e40951);
+        address feeEscrow = vm.envOr("FEE_ESCROW", 0x1C27e8F0c2a754DB23ab1608fA09c068D54d4386);
+        address factory = vm.envOr("FACTORY", 0x9d33Ba78389c8772bC114Cba47Dc1985E933e76F);
+        address locker = vm.envOr("LOCKER", 0x8a6d37B2E6a2AC7970eF69d2932757F04be0A231);
+        address multiFactory = vm.envOr("MULTI_FACTORY", 0x3ea29975a79900179F3e1aEF93347Ba4210c29C1);
+        address multiLocker = vm.envOr("MULTI_LOCKER", 0x5826FBB6201DaAcD924A3d292841DA9142952D59);
+
+        vm.startBroadcast(deployerKey);
+        PairPadFloorVault vault = new PairPadFloorVault(
+            IPoolManager(poolManager),
+            IPairPadFeeEscrow(feeEscrow),
+            IFloorSingleFactory(factory),
+            IFloorSingleLocker(locker),
+            IFloorMultiFactory(multiFactory),
+            IFloorMultiLocker(multiLocker),
+            operator
+        );
+        vm.stopBroadcast();
+
+        console2.log("PairPadFloorVault:   ", address(vault));
+        console2.log("operator:            ", operator);
+        console2.log("pool manager:        ", poolManager);
     }
 }
 

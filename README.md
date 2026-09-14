@@ -289,6 +289,47 @@ The stack is replaced as a set rather than upgraded. Earlier mainnet stacks (bon
 revisions, a v4 stack with a TWAP pricer, and a v4 stack with a fee hook) hold test tokens and
 are no longer followed by the interface.
 
+## Arc
+
+The same contracts run on Arc, where USDC is the gas token and there is no wrapped native
+asset. The pricer, multi-market factory and router take a `nativeIsReference` flag: on Robinhood
+Chain it is `true` and the reference asset is ETH at `address(0)`; on Arc it is `false`, the
+reference is the USDC ERC-20 at `0x3600000000000000000000000000000000000000` (6 decimals), and
+`address(0)` is rejected as a quote asset. Trades in the reference asset go through
+`buyWithReference`, `sellToReference` and `launchAndBuyWithReference` on the multi router, which
+pull USDC with `transferFrom` instead of `msg.value`. Everything else (single- and multi-market
+launches, quote assets priced through Uniswap v3 or v4 routes, locked LP, fee escrow, the
+creator / holders / buyback & burn / floor fee modes) is unchanged. `script/DeployArc.s.sol`
+deploys the full stack, `test/fork/ArcMode.fork.t.sol` exercises the Arc configuration against a
+Robinhood Chain fork with a 6-decimal ERC-20 as reference, and `script/SmokeArc.s.sol` is the
+launch / buy / sell / collect smoke test used on testnet.
+
+Arc testnet, chain id 5042002, explorer https://testnet.arcscan.app. Uniswap is not deployed on
+the testnet, so this stack runs against UnitFlow's fork (PoolManager
+`0x33C02bfb9e39AAAe30F8bE86b850f8ce53d20C0b`, PositionManager
+`0xA464d4e7614546a127773CedBDDd64FB81421723`, v3 Factory
+`0xAb6A8AAb7d490007634ef59d424b5d89688a1971`, SwapRouter02
+`0x23970b3a5AD7211eC4A858a29258F1e288eE2420`, Permit2
+`0x4ce562F687d0Ced27b79Ba51d79B63BD978F7F48`). Mainnet uses the canonical Uniswap deployments.
+
+| Contract | Address |
+| --- | --- |
+| PairPadLaunchFactory | `0x02E9EE8527f4AFF58f7a1E08B1b898637ce718e9` |
+| PairPadRouter | `0xE721a861b32dEc68230101EA576304a63ebeEacd` |
+| PairPadLaunchLocker | `0xE5B0B35F4927004fE8c0E437030723Eb80F6C32E` |
+| PairPadFeeEscrow | `0x96AB924F958da3a8d83fCdF5Ce692653fCEea9fD` |
+| PairPadQuotePricer | `0xcebC312381D1F816da478Acc8A37711808909d90` |
+| PairPadMultiLaunchFactory | `0x920Ca489f8c9573645b8aB00dad60fc81c9487fd` |
+| PairPadMultiRouter | `0x7cda46222a6B202f6B18A51b9a558Bc38a655083` |
+| PairPadMultiLaunchLocker | `0x344A4A773Df4FFa89AE6Dc4f1418123990a34647` |
+| PairPadFeeSplitter | `0x031f3D93A94c5F34EE3e608566245AAC271523A9` |
+| PairPadHolderVault | `0x64D085E5269fdAFfc28363f21b208f8A2EfCcD0A` |
+| PairPadBurnVault | `0x4067820296a0C717c3e31B05E98505b3215c5544` |
+| PairPadFloorVault | `0x5567633b002f935181f0fEAa8953Bd0ad5610b0D` |
+| PairPadDisperseV2 | `0x372A36543d29F00053161BCAD1cCCCC595a7cA88` |
+
+Arc mainnet addresses will be added here once the chain is live and the stack is deployed.
+
 ## Building and testing
 
 ```

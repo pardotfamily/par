@@ -71,7 +71,8 @@ contract TestStack {
             IUniswapV3FactoryMinimal(address(v3Factory)),
             address(weth),
             address(usdg),
-            IPoolManager(address(poolManager))
+            IPoolManager(address(poolManager)),
+            true
         );
         locker = new PairPadLaunchLocker(
             address(this), IPositionManager(address(positionManager)), IPairPadFeeEscrow(address(feeEscrow))

@@ -43,6 +43,15 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
     ISwapRouter02 public immutable swapRouter;
     IWETH9 public immutable weth;
 
+    /**
+     * @notice Whether native (address zero) and `weth` are two forms of one
+     * asset the router may convert between. True on Robinhood Chain. False on
+     * Arc: there `weth` is the ERC-20 face of USDC and native USDC is the same
+     * balance seen at twelve more decimals, so routes must stay on the ERC-20
+     * side and the `*WithEth` / `*ToEth` entry points are not used.
+     */
+    bool public immutable nativeIsReference;
+
     error NotPoolManager();
     error ZeroAmount();
     error ZeroAddress();
@@ -119,6 +128,7 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
         factory = factory_;
         swapRouter = swapRouter_;
         weth = weth_;
+        nativeIsReference = factory_.nativeIsReference();
     }
 
     // ---------------------------------------------------------------------
@@ -137,8 +147,26 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
         returns (uint256 tokensOut)
     {
         if (recipient == address(0)) revert ZeroAddress();
-        tokensOut = _buy(token, legs, msg.value, minTokensOut, recipient);
+        tokensOut = _buy(token, legs, Currency.wrap(address(0)), msg.value, minTokensOut, recipient);
         emit MultiBuy(token, msg.sender, msg.value, tokensOut, legs.length);
+    }
+
+    /**
+     * @notice Buys `token` with the ERC-20 reference asset (`weth`; USDC on
+     * Arc) split over `legs`. The legs' amounts must add up to `amountIn`,
+     * which the caller has approved to this contract. Mirrors `buyWithEth`
+     * for chains where the reference is not the gas token.
+     */
+    function buyWithReference(
+        address token,
+        Leg[] calldata legs,
+        uint256 amountIn,
+        uint256 minTokensOut,
+        address recipient
+    ) external nonReentrant returns (uint256 tokensOut) {
+        if (recipient == address(0)) revert ZeroAddress();
+        tokensOut = _buy(token, legs, Currency.wrap(address(weth)), amountIn, minTokensOut, recipient);
+        emit MultiBuy(token, msg.sender, amountIn, tokensOut, legs.length);
     }
 
     /**
@@ -188,6 +216,55 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
             })
         );
         emit MultiSell(token, msg.sender, tokensIn, ethOut, n);
+    }
+
+    /**
+     * @notice Sells `token` through `legs` and delivers the ERC-20 reference
+     * asset (`weth`; USDC on Arc) to `recipient`; `minOut` is on the total.
+     * Mirrors `sellToEth` for chains where the reference is not the gas token.
+     */
+    function sellToReference(address token, Leg[] calldata legs, uint256 minOut, address recipient)
+        external
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        if (recipient == address(0)) revert ZeroAddress();
+        uint256 n = legs.length;
+        if (n == 0) revert NoLegs();
+        PoolKey[] memory keys = factory.poolKeysFor(token);
+        Currency tokenCurrency = Currency.wrap(token);
+        Currency ref = Currency.wrap(address(weth));
+
+        Route[] memory routes = new Route[](n);
+        uint256 tokensIn;
+        for (uint256 i = 0; i < n; i++) {
+            if (legs[i].amountIn == 0) revert ZeroAmount();
+            tokensIn += legs[i].amountIn;
+            Hop[] memory hops = new Hop[](1 + legs[i].hops.length);
+            hops[0] = Hop({key: keys[legs[i].market], v3: false});
+            for (uint256 j = 0; j < legs[i].hops.length; j++) {
+                hops[j + 1] = legs[i].hops[j];
+            }
+            routes[i] = Route({
+                hops: hops,
+                currencyIn: tokenCurrency,
+                amountIn: legs[i].amountIn,
+                minAmountOut: 0,
+                currencyOut: ref
+            });
+        }
+        amountOut = _run(
+            Batch({
+                routes: routes,
+                payer: msg.sender,
+                recipient: recipient,
+                aggregate: true,
+                ethOut: false,
+                currencyOut: ref,
+                minAmountOut: minOut
+            })
+        );
+        emit MultiSell(token, msg.sender, tokensIn, amountOut, n);
     }
 
     /**
@@ -301,18 +378,45 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
         token = factory.launchTokenFor{value: launchFee}(params, launchConfigId, pairTokens, msg.sender);
         if (buyValue == 0 && legs.length == 0) return (token, 0);
 
-        tokensOut = _buy(token, legs, buyValue, minTokensOut, msg.sender);
+        tokensOut = _buy(token, legs, Currency.wrap(address(0)), buyValue, minTokensOut, msg.sender);
         emit MultiBuy(token, msg.sender, buyValue, tokensOut, legs.length);
+    }
+
+    /**
+     * @notice Launches a token on `pairTokens` and lands the caller's opening
+     * buy paid in the ERC-20 reference asset (`weth`; USDC on Arc). msg.value
+     * is exactly the launch fee; `amountIn` is the sum of the legs, approved
+     * to this contract. With no legs only the launch happens.
+     */
+    function launchAndBuyWithReference(
+        PairPadMultiLaunchFactory.TokenParams calldata params,
+        uint256 launchConfigId,
+        address[] calldata pairTokens,
+        Leg[] calldata legs,
+        uint256 amountIn,
+        uint256 minTokensOut
+    ) external payable nonReentrant returns (address token, uint256 tokensOut) {
+        if (msg.value != factory.launchFee()) revert InsufficientLaunchValue();
+
+        token = factory.launchTokenFor{value: msg.value}(params, launchConfigId, pairTokens, msg.sender);
+        if (amountIn == 0 && legs.length == 0) return (token, 0);
+
+        tokensOut = _buy(token, legs, Currency.wrap(address(weth)), amountIn, minTokensOut, msg.sender);
+        emit MultiBuy(token, msg.sender, amountIn, tokensOut, legs.length);
     }
 
     // ---------------------------------------------------------------------
     // Leg assembly
     // ---------------------------------------------------------------------
 
-    function _buy(address token, Leg[] calldata legs, uint256 ethIn, uint256 minTokensOut, address recipient)
-        private
-        returns (uint256 tokensOut)
-    {
+    function _buy(
+        address token,
+        Leg[] calldata legs,
+        Currency currencyIn,
+        uint256 amountIn,
+        uint256 minTokensOut,
+        address recipient
+    ) private returns (uint256 tokensOut) {
         uint256 n = legs.length;
         if (n == 0) revert NoLegs();
         PoolKey[] memory keys = factory.poolKeysFor(token);
@@ -329,13 +433,13 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
             hops[legs[i].hops.length] = Hop({key: keys[legs[i].market], v3: false});
             routes[i] = Route({
                 hops: hops,
-                currencyIn: Currency.wrap(address(0)),
+                currencyIn: currencyIn,
                 amountIn: legs[i].amountIn,
                 minAmountOut: 0,
                 currencyOut: Currency.wrap(token)
             });
         }
-        if (total != ethIn) revert NativeValueMismatch();
+        if (total != amountIn) revert NativeValueMismatch();
 
         tokensOut = _run(
             Batch({
@@ -567,8 +671,9 @@ contract PairPadMultiRouter is IUnlockCallback, ReentrancyGuard {
         return (hopIn, hopOut, false);
     }
 
+    /// @dev The reference asset in either form; native only counts where it wraps 1:1 into `weth`.
     function _isEth(Currency c) private view returns (bool) {
-        return c.isAddressZero() || Currency.unwrap(c) == address(weth);
+        return Currency.unwrap(c) == address(weth) || (nativeIsReference && c.isAddressZero());
     }
 
     function _sendEth(address recipient, uint256 amount) private {

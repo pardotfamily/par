@@ -85,7 +85,8 @@ contract QuotePricerTest is Test {
             IUniswapV3FactoryMinimal(address(v3Factory)),
             address(weth),
             address(usdg),
-            IPoolManager(address(v4))
+            IPoolManager(address(v4)),
+            true
         );
     }
 

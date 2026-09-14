@@ -59,8 +59,11 @@ contract Deploy is Script {
         address usdg = vm.envOr("USDG", RH_USDG);
         address protocolFeeRecipient = vm.envOr("PROTOCOL_FEE_RECIPIENT", owner);
         uint256 launchFee = vm.envOr("LAUNCH_FEE", uint256(0.0005 ether));
+        // False on Arc (5042 / 5042002): USDC is the gas token, WETH is its ERC-20 interface, native is never paired.
+        bool nativeIsReference = vm.envOr("NATIVE_IS_REFERENCE", block.chainid != 5042 && block.chainid != 5042002);
 
         if (block.chainid == 4663) {
+            require(nativeIsReference, "mainnet: NATIVE_IS_REFERENCE override");
             require(poolManager == RH_POOL_MANAGER, "mainnet: POOL_MANAGER override");
             require(positionManager == RH_POSITION_MANAGER, "mainnet: POSITION_MANAGER override");
             require(v3Factory == RH_V3_FACTORY, "mainnet: V3_FACTORY override");
@@ -77,7 +80,7 @@ contract Deploy is Script {
         // 2. Spot pricer for permissionless quote assets (V3 pools, hookless
         //    V4 pools, and V4 pools found through launchpad registries).
         PairPadQuotePricer quotePricer = new PairPadQuotePricer(
-            owner, IUniswapV3FactoryMinimal(v3Factory), weth, usdg, IPoolManager(poolManager)
+            owner, IUniswapV3FactoryMinimal(v3Factory), weth, usdg, IPoolManager(poolManager), nativeIsReference
         );
         if (block.chainid == 4663) {
             quotePricer.setV4HookAllowed(PONS_HOOK, true);
