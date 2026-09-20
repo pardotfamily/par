@@ -328,7 +328,52 @@ the testnet, so this stack runs against UnitFlow's fork (PoolManager
 | PairPadFloorVault | `0x5567633b002f935181f0fEAa8953Bd0ad5610b0D` |
 | PairPadDisperseV2 | `0x372A36543d29F00053161BCAD1cCCCC595a7cA88` |
 
-Arc mainnet addresses will be added here once the chain is live and the stack is deployed.
+Arc mainnet (chain id 5042, live since 2026-09-16) runs the same contracts at the same addresses as the testnet: factory 0x920Ca489f8c9573645b8aB00dad60fc81c9487fd, router 0x7cda46222a6B202f6B18A51b9a558Bc38a655083, locker 0x344A4A773Df4FFa89AE6Dc4f1418123990a34647, escrow 0x96AB924F958da3a8d83fCdF5Ce692653fCEea9fD, pricer 0xcebC312381D1F816da478Acc8A37711808909d90, vaults 0x64D085E5269fdAFfc28363f21b208f8A2EfCcD0A (holders) / 0x4067820296a0C717c3e31B05E98505b3215c5544 (burn) / 0x5567633b002f935181f0fEAa8953Bd0ad5610b0D (floor), DisperseV2 0x372A36543d29F00053161BCAD1cCCCC595a7cA88; PoolManager 0x8366a39CC670B4001A1121B8F6A443A643e40951; app https://par.family (Arc rows carry chainId 5042), indexer https://api-arc.par.family.
+
+## Base and BNB Chain
+
+`script/DeployChain.s.sol` deploys the whole stack (both factories, routers, lockers, escrow,
+pricer, fee splitter and the three vaults) on a chain whose gas token is the reference, from a
+table of that chain's Uniswap addresses. `test/fork/ChainStack.fork.t.sol` runs the launch, trade,
+collect and fee-mode flows against a fork of each (`FORK=1 forge test --fork-url ...`).
+
+Base, chain id 8453, deployed 2026-09-18 at block 51489805. Same deployer and nonces as Arc, so the
+same par addresses as Arc (above); Uniswap v4 PoolManager 0x498581fF718922c3f8e6A244956aF099B2652b2b,
+WETH 0x4200000000000000000000000000000000000006, second anchor USDC 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913.
+Launch fee 0.0005 ETH, opening cap 1.36 ETH, depth floor 1 ETH.
+
+BNB Chain, chain id 56, deployed 2026-09-20 at block 122881639. The V3 side is PancakeSwap's,
+which is where BNB Chain's liquidity is: the pricer reads Pancake V3 pools through Pancake's factory
+(0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865; fee tiers 100/500/2500/10000, set with the owner's
+`setV3FeeTiers`) and the routers' external hops go through Pancake's SmartRouter
+(0x13f4EA83D0bd40E75C8222255bc855a974568Dd4, `exactInputSingle` as on Uniswap's SwapRouter02).
+Pancake V3 pools pack `slot0.feeProtocol` as uint32, hence the wider field in the pricer's minimal
+pool interface. The par pools themselves are Uniswap v4 pools (PoolManager
+0x28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF).
+
+```
+PairPadLaunchFactory          0x456645ad38d099358Cb95ff743736663CDB31a25
+PairPadRouter                 0x9DF1B1687f95Ce8a42fC8c861F767B6D52C346ab
+PairPadLaunchLocker           0xBE14efB8d23346730025902813AF1bE4a4955eb3
+PairPadMultiLaunchFactory     0x6715d9C03590F0e7b11A7Cd5bab2eAD4F77e666A
+PairPadMultiRouter            0x7b62174524f0c2d4c475ac05ee9a6F893D625a10
+PairPadMultiLocker            0x03136E9FE0be1943191Cf022EFa40B436CDdCBdE
+PairPadFeeEscrow              0x389216d9F1A3BC72415Ddf16cA50Ca5Bf8B5b065
+PairPadQuotePricer            0x335b39437637A09d791848eB675E5F8D290bba71
+PairPadFeeSplitter            0xD713367eD15bC42BF23Ef2D449629053A16a30D9
+PairPadHolderVault            0xb9E88952596F56f090A36D2FE2B37F50A29dd459
+PairPadBurnVault              0x5EAE87d4AaF8196079B009234938C0F5Baa79578
+PairPadFloorVault             0x3b90bef8FA9694B46a01d5E4073937fB913F1799
+PairPadDisperseV2             0x589576e4f610B85DBd7a06015acEacF732DD9828
+WBNB                          0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c
+USDT (second anchor)          0x55d398326f99059fF775485246999027B3197955
+```
+Launch fee 0.002 BNB, opening cap 4.7 BNB, depth floor 2.5 BNB. A first BNB stack at the Base
+addresses (Uniswap V3 side) has launches disabled.
+
+Indexers: https://api-base.par.family and https://api-bnb.par.family (also reachable as
+https://par.family/idx/8453 and https://par.family/idx/56). One app for all four chains at
+https://par.family; token pages are /token/<rh|arc|base|bnb>/<address>.
 
 ## Building and testing
 

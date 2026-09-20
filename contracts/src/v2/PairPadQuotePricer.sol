@@ -13,7 +13,13 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {Hop} from "./libraries/Hop.sol";
 
-/// @dev The slice of the Uniswap V3 pool surface the pricer consults.
+/**
+ * @dev The slice of the Uniswap V3 pool surface the pricer consults. Only
+ * `sqrtPriceX96` is read; `feeProtocol` is declared as uint32 because
+ * PancakeSwap V3 (a V3 fork with the same layout otherwise) packs it that
+ * wide, and a uint8 declaration makes decoding Pancake's slot0 revert.
+ * Uniswap's uint8 value decodes into a uint32 unchanged.
+ */
 interface IUniswapV3PoolMinimal {
     function slot0()
         external
@@ -24,7 +30,7 @@ interface IUniswapV3PoolMinimal {
             uint16 observationIndex,
             uint16 observationCardinality,
             uint16 observationCardinalityNext,
-            uint8 feeProtocol,
+            uint32 feeProtocol,
             bool unlocked
         );
 }
@@ -90,6 +96,7 @@ contract PairPadQuotePricer is Ownable2Step {
 
     error QuoteAssetNotPriceable(address quoteToken);
     error ZeroAddress();
+    error BadFeeTiers();
     error ConversionOverflow();
     error HookNotAllowed(address hook);
     error NotAnAnchorPool();
@@ -109,6 +116,7 @@ contract PairPadQuotePricer is Ownable2Step {
     error NoPathStored(address token);
 
     event MinReferenceDepthUpdated(uint256 minReferenceEth);
+    event V3FeeTiersUpdated(uint24[] tiers);
     event V4HookAllowed(address indexed hook, bool allowed);
     event V4PoolRegistered(bytes32 indexed poolId, address indexed token, address indexed anchor, PoolKey key);
     event RegistryAdded(address indexed registry);
@@ -175,10 +183,13 @@ contract PairPadQuotePricer is Ownable2Step {
         uint256 faultHop;
     }
 
-    /// @dev Standard Uniswap V3 fee tiers scanned for an automatic route.
-    uint24 private constant FEE_LOW = 500;
-    uint24 private constant FEE_MEDIUM = 3_000;
-    uint24 private constant FEE_HIGH = 10_000;
+    /**
+     * @notice V3 fee tiers scanned for an automatic route. Uniswap's three
+     * by default; the owner sets PancakeSwap's (100, 500, 2500, 10000) where
+     * `v3Factory` is Pancake's, as on BNB Chain.
+     */
+    uint24[] public v3FeeTiers = [uint24(500), uint24(3_000), uint24(10_000)];
+    uint256 private constant MAX_FEE_TIERS = 8;
 
     uint8 public constant MAX_HOPS = 4;
     uint8 public constant MAX_V4_POOLS_PER_TOKEN = 8;
@@ -238,6 +249,20 @@ contract PairPadQuotePricer is Ownable2Step {
     // ---------------------------------------------------------------------
     // Owner configuration
     // ---------------------------------------------------------------------
+
+    /// @notice Replaces the V3 fee tiers the automatic search scans (1 to 8, none zero).
+    function setV3FeeTiers(uint24[] calldata tiers) external onlyOwner {
+        if (tiers.length == 0 || tiers.length > MAX_FEE_TIERS) revert BadFeeTiers();
+        for (uint256 i = 0; i < tiers.length; ++i) {
+            if (tiers[i] == 0) revert BadFeeTiers();
+        }
+        v3FeeTiers = tiers;
+        emit V3FeeTiersUpdated(tiers);
+    }
+
+    function v3FeeTiersLength() external view returns (uint256) {
+        return v3FeeTiers.length;
+    }
 
     /// @notice Sets the ETH depth every hop of a route must have.
     function setMinReferenceEth(uint256 minEth) external onlyOwner {
@@ -688,7 +713,7 @@ contract PairPadQuotePricer is Ownable2Step {
         view
         returns (address best, uint24 bestFee, uint256 bestBalance)
     {
-        uint24[3] memory tiers = [FEE_LOW, FEE_MEDIUM, FEE_HIGH];
+        uint24[] memory tiers = v3FeeTiers;
         for (uint256 i = 0; i < tiers.length; ++i) {
             address pool = v3Factory.getPool(token, anchor, tiers[i]);
             if (pool == address(0)) continue;
