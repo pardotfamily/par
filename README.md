@@ -414,6 +414,24 @@ The live launch factories do not use the hook yet; existing pools keep their LP-
 (pool keys are immutable). Fork tests: `forge test --match-contract QuoteFeeHook --fork-url <rpc>`
 (`POOL_MANAGER` in the env for chains other than Robinhood Chain).
 
+## Creator accounts: fees to an X or GitHub account
+
+A launch's `creatorFeeRecipient` can be the fee account of a social account (`contracts/src/creator/`).
+`CreatorAccountFactory` derives one address per (platform, immutable user id) through CREATE2, so it
+is the same on every chain and valid before any code exists there; `accountFor("x", userId)` returns
+it. Fees credit to that address in `PairPadFeeEscrow` like for any recipient. The account has no
+owner until its holder logs in on par.family and links a wallet: the factory's attester signs an
+EIP-712 claim (single-use nonce, ten-minute deadline, bound to chain, factory, account and wallet),
+the account checks it once and sets the owner. From then on only the owner moves funds
+(`withdraw`, `execute`, two-step `transferOwnership`); `pull(escrow, token)` is permissionless
+because the money only ever goes into the account. The factory owner can only rotate the attester.
+
+```
+CreatorAccountFactory  0x5f71c7E228D3d9d69E2f4C1eACe55F5c5C7237d8   (4663, 5042, 8453, 56)
+```
+
+Tests: `forge test --match-contract CreatorAccountTest`.
+
 ## Building and testing
 
 ```
