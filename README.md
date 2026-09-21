@@ -375,6 +375,45 @@ Indexers: https://api-base.par.family and https://api-bnb.par.family (also reach
 https://par.family/idx/8453 and https://par.family/idx/56). One app for all four chains at
 https://par.family; token pages are /token/<rh|arc|base|bnb>/<address>.
 
+## Quote-fee hook (review deployment, not yet used by launches)
+
+A plain v4 pool charges its LP fee on the input currency, so buys pay in quote and sells pay
+in the launch token. `PairPadQuoteFeeHook` (`contracts/src/hook/`) moves the trading fee into
+the hook so it is always taken in the pool's quote currency: through the specified delta in
+`beforeSwap` when quote is the specified currency (exact-in buy, exact-out sell), through the
+unspecified delta in `afterSwap` otherwise (exact-in sell, exact-out buy). Pools using it set
+their LP fee to zero. Fees sit as ERC-6909 claims in the PoolManager until the permissionless
+`collect(key)` pays the protocol share to the protocol recipient and credits the creator share
+to `PairPadFeeEscrow`, where the position lockers pay it today, so wallets and the
+holders/burn/floor vaults keep the same claim flow, now in quote only.
+
+The hook has no owner and nothing upgradeable; swaps take no hook data and gate no caller.
+Pools can only be registered and initialized by factories `PairPadHookRegistry` allows, each
+with a configuration (quote, fee bps ≤ 20%, protocol share, creator and protocol recipients)
+fixed once at registration. Flags: beforeInitialize, beforeSwap, afterSwap,
+beforeSwapReturnDelta, afterSwapReturnDelta (`…20CC`).
+
+Deployed through the canonical CREATE2 deployer, so the addresses are the same on Robinhood
+Chain (4663), Arc (5042), Base (8453) and BNB Chain (56):
+
+```
+PairPadHookRegistry   0xC90d45CE9a1b3cEc000b68577e1b76d665776B87
+PairPadQuoteFeeHook   0x0A554e092771B5B271171A6123b7f0CfD15460cc
+```
+
+Review pools (quote / PHT test token, 1% fee, one buy, one sell and a collect each):
+
+```
+Robinhood Chain  ETH   pool 0x4eafd7c66d0caa3b6ff775239cfe97699504237f43fd768c9b4ecc26c8a74a29
+Arc              USDC  pool 0xa74e31c45183b325e18b2eed4029a0779870e3e6d92b788ab3f6c18ec648776e
+Base             ETH   pool 0x778581c81da159bf025a072089544d8128fc576e619188d97adeb63675d6cfa5
+BNB Chain        BNB   pool 0xcc463f4b2b547e6d8e30f916d1964c584258a08babedfc3a3959941d9eae8d9a
+```
+
+The live launch factories do not use the hook yet; existing pools keep their LP-fee model
+(pool keys are immutable). Fork tests: `forge test --match-contract QuoteFeeHook --fork-url <rpc>`
+(`POOL_MANAGER` in the env for chains other than Robinhood Chain).
+
 ## Building and testing
 
 ```
